@@ -227,6 +227,56 @@ class PixelDecoderUNet(nn.Module):
         return pred
 
 
+class StructuralLayerUNet(nn.Module):
+    def __init__(
+        self,
+        num_stages: int,
+        base_channels: int = 32,
+        stage_embed_dim: int = 16,
+        cond_dim: int = 128,
+    ):
+        super().__init__()
+        self.stage_embed = nn.Embedding(num_stages, stage_embed_dim)
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(stage_embed_dim, cond_dim),
+            nn.SiLU(),
+            nn.Linear(cond_dim, cond_dim),
+            nn.SiLU(),
+        )
+
+        c1 = base_channels
+        c2 = base_channels * 2
+        c3 = base_channels * 4
+        c4 = base_channels * 8
+
+        self.enc1 = FiLMBlock(3, c1, cond_dim)
+        self.down1 = nn.Conv2d(c1, c2, kernel_size=4, stride=2, padding=1)
+        self.enc2 = FiLMBlock(c2, c2, cond_dim)
+        self.down2 = nn.Conv2d(c2, c3, kernel_size=4, stride=2, padding=1)
+        self.bottleneck = FiLMBlock(c3, c4, cond_dim)
+        self.up2 = nn.Conv2d(c4, c3, kernel_size=3, padding=1)
+        self.dec2 = FiLMBlock(c3 + c2, c2, cond_dim)
+        self.up1 = nn.Conv2d(c2, c2, kernel_size=3, padding=1)
+        self.dec1 = FiLMBlock(c2 + c1, c1, cond_dim)
+        self.out = nn.Conv2d(c1, 1, kernel_size=1)
+
+    def forward(self, src_image: torch.Tensor, src_stage_idx: torch.Tensor) -> torch.Tensor:
+        cond = self.cond_mlp(self.stage_embed(src_stage_idx))
+
+        e1 = self.enc1(src_image, cond)
+        e2 = self.enc2(self.down1(e1), cond)
+        b = self.bottleneck(self.down2(e2), cond)
+
+        u2 = F.interpolate(b, size=e2.shape[-2:], mode="bilinear", align_corners=False)
+        u2 = self.up2(u2)
+        d2 = self.dec2(torch.cat([u2, e2], dim=1), cond)
+
+        u1 = F.interpolate(d2, size=e1.shape[-2:], mode="bilinear", align_corners=False)
+        u1 = self.up1(u1)
+        d1 = self.dec1(torch.cat([u1, e1], dim=1), cond)
+        return self.out(d1)
+
+
 def image_to_tensor(image: Image.Image, image_size: int) -> torch.Tensor:
     rgb = image.convert("RGB").resize((image_size, image_size), Image.BICUBIC)
     array = np.asarray(rgb, dtype=np.float32) / 255.0
@@ -237,6 +287,44 @@ def tensor_to_pil(image: torch.Tensor) -> Image.Image:
     image = image.detach().cpu().clamp(0.0, 1.0)
     array = (image.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
     return Image.fromarray(array, mode="RGB")
+
+
+def mask_to_tensor(image: Image.Image, image_size: int) -> torch.Tensor:
+    gray = image.convert("L").resize((image_size, image_size), Image.BICUBIC)
+    array = np.asarray(gray, dtype=np.float32) / 255.0
+    return torch.from_numpy(array).unsqueeze(0).contiguous()
+
+
+def compose_white_layer(src_image: torch.Tensor, layer: torch.Tensor) -> torch.Tensor:
+    if layer.shape[1] == 1:
+        layer = layer.repeat(1, src_image.shape[1], 1, 1)
+    return torch.maximum(src_image, layer.clamp(0.0, 1.0))
+
+
+def dice_loss_from_logits(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    probs = torch.sigmoid(logits)
+    numerator = 2.0 * torch.sum(probs * target, dim=(1, 2, 3))
+    denominator = torch.sum(probs, dim=(1, 2, 3)) + torch.sum(target, dim=(1, 2, 3)) + eps
+    return 1.0 - torch.mean((numerator + eps) / denominator)
+
+
+def focal_bce_loss_from_logits(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    alpha: float = 0.75,
+    gamma: float = 2.0,
+    pos_weight: float = 8.0,
+) -> torch.Tensor:
+    bce = F.binary_cross_entropy_with_logits(
+        logits,
+        target,
+        reduction="none",
+        pos_weight=torch.tensor(float(pos_weight), dtype=logits.dtype, device=logits.device),
+    )
+    probs = torch.sigmoid(logits)
+    p_t = probs * target + (1.0 - probs) * (1.0 - target)
+    alpha_t = alpha * target + (1.0 - alpha) * (1.0 - target)
+    return torch.mean(alpha_t * (1.0 - p_t).pow(gamma) * bce)
 
 
 def ssim_loss(pred: torch.Tensor, target: torch.Tensor, window_size: int = 11) -> torch.Tensor:

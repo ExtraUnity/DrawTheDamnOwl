@@ -9,7 +9,9 @@ from PIL import Image, ImageDraw, ImageOps
 
 from learning_utils import (
     PixelDecoderUNet,
+    StructuralLayerUNet,
     TransitionMLP,
+    compose_white_layer,
     default_device,
     embed_image_with_clip,
     image_to_tensor,
@@ -59,6 +61,28 @@ def parse_args() -> argparse.Namespace:
         "--pixel-decoder-checkpoint",
         default=str(LEARNING_ROOT / "pixel_decoder" / "best_pixel_decoder.pt"),
         help="Path to trained pixel decoder checkpoint from train_pixel_decoder.py",
+    )
+    parser.add_argument(
+        "--structural-decoder-checkpoint",
+        default=str(LEARNING_ROOT / "structural_decoder" / "best_structural_decoder.pt"),
+        help="Path to trained structural layer decoder checkpoint",
+    )
+    parser.add_argument(
+        "--disable-structural-decoder",
+        action="store_true",
+        help="In pixel mode, skip structural layer decoder and use the pixel decoder for all stages",
+    )
+    parser.add_argument(
+        "--structural-until-stage",
+        type=int,
+        default=4,
+        help="Use structural decoder for predicted stages up to and including this stage",
+    )
+    parser.add_argument(
+        "--structural-threshold",
+        type=float,
+        default=None,
+        help="Override structural layer probability threshold from checkpoint",
     )
     parser.add_argument(
         "--save-retrieval-fallback",
@@ -251,9 +275,30 @@ def load_pixel_decoder(checkpoint_path: Path, device: torch.device) -> Tuple[Pix
     return model, config
 
 
+def load_structural_decoder(checkpoint_path: Path, device: torch.device) -> Tuple[StructuralLayerUNet, Dict[str, object]]:
+    require_file(checkpoint_path, "Structural decoder checkpoint")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if not isinstance(checkpoint, dict) or "model_config" not in checkpoint:
+        raise RuntimeError(f"Structural decoder checkpoint is missing model_config: {checkpoint_path}")
+
+    config = dict(checkpoint["model_config"])
+    model = StructuralLayerUNet(
+        num_stages=int(config["num_stages"]),
+        base_channels=int(config.get("base_channels", 32)),
+        stage_embed_dim=int(config.get("stage_embed_dim", 16)),
+        cond_dim=int(config.get("cond_dim", 128)),
+    ).to(device)
+
+    state = checkpoint.get("model_state_dict", checkpoint)
+    model.load_state_dict(state)
+    model.eval()
+    return model, config
+
+
 def rollout_stages_with_pixel_decoder(
     model: TransitionMLP,
     pixel_decoder: PixelDecoderUNet,
+    structural_decoder: StructuralLayerUNet | None,
     current_embedding: np.ndarray,
     input_image: Path,
     stage_bank: Dict[int, Dict[str, object]],
@@ -264,6 +309,8 @@ def rollout_stages_with_pixel_decoder(
     image_size: int,
     save_retrieval_fallback: bool,
     use_retrieved_embedding: bool,
+    structural_until_stage: int,
+    structural_threshold: float,
 ) -> List[Dict[str, object]]:
     rollout: List[Dict[str, object]] = []
 
@@ -273,22 +320,35 @@ def rollout_stages_with_pixel_decoder(
     for src_stage in range(start_stage, end_stage):
         src_tensor = torch.from_numpy(current_embedding).unsqueeze(0).to(device)
         src_stage_tensor = torch.tensor([src_stage], dtype=torch.long, device=device)
+        predicted_stage = src_stage + 1
 
         with torch.no_grad():
             pred = model(src_tensor, src_stage_tensor)
             pred_np = pred[0].detach().cpu().numpy().astype(np.float32)
             pred_np /= max(float(np.linalg.norm(pred_np)), 1e-12)
-            generated = pixel_decoder(current_image.unsqueeze(0), pred, src_stage_tensor)[0]
+            if structural_decoder is not None and predicted_stage <= structural_until_stage:
+                layer_probs = torch.sigmoid(structural_decoder(current_image.unsqueeze(0), src_stage_tensor))
+                layer = (layer_probs >= structural_threshold).to(dtype=torch.float32)
+                generated = compose_white_layer(current_image.unsqueeze(0), layer)[0]
+                layer_path = output_dir / f"stage_{predicted_stage:02d}_structural_layer.png"
+                tensor_to_pil(layer[0].repeat(3, 1, 1)).save(layer_path)
+                generator_name = "structural"
+            else:
+                generated = pixel_decoder(current_image.unsqueeze(0), pred, src_stage_tensor)[0]
+                layer_path = None
+                generator_name = "dense_pixel"
 
-        predicted_stage = src_stage + 1
         generated_path = output_dir / f"stage_{predicted_stage:02d}_generated.png"
         tensor_to_pil(generated).save(generated_path)
 
         step: Dict[str, object] = {
             "source_stage": src_stage,
             "predicted_stage": predicted_stage,
+            "generator": generator_name,
             "generated_image_path": str(generated_path),
         }
+        if layer_path is not None:
+            step["generated_layer_path"] = str(layer_path)
 
         match = None
         if save_retrieval_fallback or use_retrieved_embedding:
@@ -349,12 +409,26 @@ def main() -> None:
 
     current_embedding = embed_image_with_clip(input_image, args.model_id, device)
     pixel_decoder_config = None
+    structural_decoder_config = None
     if args.render_mode == "pixel":
         pixel_decoder, pixel_decoder_config = load_pixel_decoder(Path(args.pixel_decoder_checkpoint), device)
         image_size = int(pixel_decoder_config.get("image_size", 256))
+        structural_decoder = None
+        structural_threshold = 0.35
+        if not args.disable_structural_decoder:
+            structural_decoder, structural_decoder_config = load_structural_decoder(
+                Path(args.structural_decoder_checkpoint), device
+            )
+            image_size = int(structural_decoder_config.get("image_size", image_size))
+            structural_threshold = float(
+                args.structural_threshold
+                if args.structural_threshold is not None
+                else structural_decoder_config.get("threshold", structural_threshold)
+            )
         rollout = rollout_stages_with_pixel_decoder(
             model=model,
             pixel_decoder=pixel_decoder,
+            structural_decoder=structural_decoder,
             current_embedding=current_embedding,
             input_image=input_image,
             stage_bank=stage_bank,
@@ -365,6 +439,8 @@ def main() -> None:
             image_size=image_size,
             save_retrieval_fallback=args.save_retrieval_fallback,
             use_retrieved_embedding=args.use_retrieved_embedding,
+            structural_until_stage=args.structural_until_stage,
+            structural_threshold=structural_threshold,
         )
     else:
         rollout = rollout_stages(
@@ -384,6 +460,14 @@ def main() -> None:
         "render_mode": args.render_mode,
         "pixel_decoder_checkpoint": args.pixel_decoder_checkpoint if args.render_mode == "pixel" else None,
         "pixel_decoder_config": pixel_decoder_config,
+        "structural_decoder_checkpoint": (
+            args.structural_decoder_checkpoint
+            if args.render_mode == "pixel" and not args.disable_structural_decoder
+            else None
+        ),
+        "structural_decoder_config": structural_decoder_config,
+        "structural_until_stage": args.structural_until_stage,
+        "structural_threshold": args.structural_threshold,
         "model_id": args.model_id,
         "device": str(device),
         "start_stage": args.start_stage,

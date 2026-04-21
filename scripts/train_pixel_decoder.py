@@ -60,6 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-channels", type=int, default=32, help="UNet base channel count")
     parser.add_argument("--cond-dim", type=int, default=256, help="Conditioning MLP width")
     parser.add_argument("--stage-embed-dim", type=int, default=16, help="Learned source-stage embedding size")
+    parser.add_argument("--min-src-stage", type=int, default=0, help="Minimum source stage to train")
+    parser.add_argument("--max-src-stage", type=int, default=8, help="Maximum source stage to train")
     parser.add_argument(
         "--output-mode",
         choices=["residual", "direct"],
@@ -134,12 +136,19 @@ def load_embedding_lookup(path: Path) -> Tuple[Dict[Tuple[str, int], np.ndarray]
     return lookup, int(embeddings.shape[1])
 
 
-def load_transitions(path: Path, lookup: Dict[Tuple[str, int], np.ndarray]) -> List[Dict[str, object]]:
+def load_transitions(
+    path: Path,
+    lookup: Dict[Tuple[str, int], np.ndarray],
+    min_src_stage: int,
+    max_src_stage: int,
+) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
     for row in read_csv_rows(path, description="Transition manifest"):
         stem = str(row["stem"])
         src_stage = int(row["src_stage_idx"])
         tgt_stage = int(row["tgt_stage_idx"])
+        if src_stage < min_src_stage or src_stage > max_src_stage:
+            continue
         src_key = (stem, src_stage)
         tgt_key = (stem, tgt_stage)
         if src_key not in lookup or tgt_key not in lookup:
@@ -457,7 +466,7 @@ def main() -> None:
     device = torch.device(args.device)
 
     lookup, embedding_dim = load_embedding_lookup(Path(args.embeddings_npz))
-    rows = load_transitions(Path(args.transitions_csv), lookup)
+    rows = load_transitions(Path(args.transitions_csv), lookup, args.min_src_stage, args.max_src_stage)
     splits = split_rows(rows)
 
     datasets = {name: PixelTransitionDataset(split_rows_, args.image_size) for name, split_rows_ in splits.items()}
@@ -529,6 +538,8 @@ def main() -> None:
             "image_size": args.image_size,
             "output_mode": args.output_mode,
             "residual_scale": args.residual_scale,
+            "min_src_stage": args.min_src_stage,
+            "max_src_stage": args.max_src_stage,
         },
     }
     torch.save(checkpoint, output_dir / "best_pixel_decoder.pt")

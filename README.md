@@ -153,7 +153,20 @@ Run latent rollout inference from a rough sketch and retrieve nearest stage imag
 python scripts/infer_transition_rollout.py data/owl_output/stage_00_base/owl_23_stage00.png --checkpoint data/owl_output/learning/ar_baseline/best_model.pt --embeddings-npz data/owl_output/learning/embeddings/clip_embeddings_all.npz --manifest-frames data/owl_output/learning/manifest_frames.csv --output-dir data/owl_output/learning/inference
 ```
 
-Train a one-step pixel decoder conditioned on the current stage image, predicted next-stage latent, and stage index:
+Train a structural layer decoder for sparse line-art stages `0->1` through `3->4`:
+
+```bash
+python scripts/train_structural_layer_decoder.py \
+	--transitions-csv data/owl_output/learning/manifest_transitions.csv \
+	--data-root data/owl_output \
+	--output-dir data/owl_output/learning/structural_decoder \
+	--device cuda \
+	--base-channels 32 \
+	--cond-dim 128 \
+	--batch-size 8
+```
+
+Train a dense one-step pixel decoder for appearance stages `4->5` through `8->9`:
 
 ```bash
 python scripts/train_pixel_decoder.py \
@@ -162,6 +175,9 @@ python scripts/train_pixel_decoder.py \
 	--latent-checkpoint data/owl_output/learning/ar_baseline/best_model.pt \
 	--latent-metrics-json data/owl_output/learning/ar_baseline/metrics.json \
 	--output-dir data/owl_output/learning/pixel_decoder \
+	--device cuda \
+	--min-src-stage 4 \
+	--max-src-stage 8 \
 	--output-mode residual \
 	--change-weight 8.0 \
 	--foreground-weight 2.0 \
@@ -177,6 +193,7 @@ python scripts/infer_transition_rollout.py data/owl_output/stage_00_base/owl_23_
 	--render-mode pixel \
 	--checkpoint data/owl_output/learning/ar_baseline/best_model.pt \
 	--pixel-decoder-checkpoint data/owl_output/learning/pixel_decoder/best_pixel_decoder.pt \
+	--structural-decoder-checkpoint data/owl_output/learning/structural_decoder/best_structural_decoder.pt \
 	--embeddings-npz data/owl_output/learning/embeddings/clip_embeddings_all.npz \
 	--manifest-frames data/owl_output/learning/manifest_frames.csv \
 	--output-dir data/owl_output/learning/inference_pixel \
