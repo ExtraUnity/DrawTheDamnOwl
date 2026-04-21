@@ -60,11 +60,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-channels", type=int, default=32, help="UNet base channel count")
     parser.add_argument("--cond-dim", type=int, default=256, help="Conditioning MLP width")
     parser.add_argument("--stage-embed-dim", type=int, default=16, help="Learned source-stage embedding size")
+    parser.add_argument(
+        "--output-mode",
+        choices=["residual", "direct"],
+        default="residual",
+        help="Residual predicts x_t + delta; direct predicts the full next image",
+    )
+    parser.add_argument("--residual-scale", type=float, default=1.0, help="Maximum residual delta magnitude")
     parser.add_argument("--l1-weight", type=float, default=1.0, help="L1 reconstruction loss weight")
     parser.add_argument("--ssim-weight", type=float, default=0.5, help="SSIM loss weight")
     parser.add_argument("--lpips-weight", type=float, default=0.0, help="LPIPS loss weight; requires lpips package")
     parser.add_argument("--edge-weight", type=float, default=0.2, help="Sobel edge loss weight")
     parser.add_argument("--edge-max-stage", type=int, default=4, help="Apply edge loss through this source stage")
+    parser.add_argument(
+        "--change-weight",
+        type=float,
+        default=8.0,
+        help="Extra L1 weight for pixels that change between source and target",
+    )
+    parser.add_argument(
+        "--foreground-weight",
+        type=float,
+        default=2.0,
+        help="Extra L1 weight for non-background target pixels",
+    )
+    parser.add_argument("--change-threshold", type=float, default=0.03, help="Pixel-change threshold for weighted L1")
+    parser.add_argument("--foreground-threshold", type=float, default=0.05, help="Target luminance threshold for weighted L1")
     parser.add_argument("--patience", type=int, default=15, help="Early stopping patience on validation loss")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader worker count")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -194,13 +215,24 @@ def build_lpips(weight: float, device: torch.device):
 
 
 def compute_loss(
+    src: torch.Tensor,
     pred: torch.Tensor,
     target: torch.Tensor,
     src_stage: torch.Tensor,
     lpips_model,
     args: argparse.Namespace,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    l1 = F.l1_loss(pred, target)
+    per_pixel_l1 = torch.abs(pred - target)
+    change = torch.mean(torch.abs(target - src), dim=1, keepdim=True) > float(args.change_threshold)
+    target_luma = 0.299 * target[:, 0:1] + 0.587 * target[:, 1:2] + 0.114 * target[:, 2:3]
+    foreground = target_luma > float(args.foreground_threshold)
+    weights = (
+        1.0
+        + float(args.change_weight) * change.to(dtype=pred.dtype)
+        + float(args.foreground_weight) * foreground.to(dtype=pred.dtype)
+    )
+    l1 = torch.mean(per_pixel_l1 * weights)
+    unweighted_l1 = F.l1_loss(pred, target)
     ssim = ssim_loss(pred, target)
 
     early_mask = src_stage <= int(args.edge_max_stage)
@@ -223,6 +255,7 @@ def compute_loss(
     return total, {
         "loss": float(total.detach().cpu().item()),
         "l1": float(l1.detach().cpu().item()),
+        "unweighted_l1": float(unweighted_l1.detach().cpu().item()),
         "ssim": float(ssim.detach().cpu().item()),
         "edge": float(edge.detach().cpu().item()),
         "lpips": float(lpips_value.detach().cpu().item()),
@@ -231,7 +264,14 @@ def compute_loss(
 
 def mean_metrics(values: List[Dict[str, float]]) -> Dict[str, float]:
     if not values:
-        return {"loss": float("nan"), "l1": float("nan"), "ssim": float("nan"), "edge": float("nan"), "lpips": float("nan")}
+        return {
+            "loss": float("nan"),
+            "l1": float("nan"),
+            "unweighted_l1": float("nan"),
+            "ssim": float("nan"),
+            "edge": float("nan"),
+            "lpips": float("nan"),
+        }
     keys = values[0].keys()
     return {key: float(np.mean([item[key] for item in values])) for key in keys}
 
@@ -258,7 +298,7 @@ def train_one_epoch(
             pred_embedding = latent_model(src_embedding, src_stage)
 
         pred_image = decoder(src_image, pred_embedding, src_stage)
-        loss, metrics = compute_loss(pred_image, tgt_image, src_stage, lpips_model, args)
+        loss, metrics = compute_loss(src_image, pred_image, tgt_image, src_stage, lpips_model, args)
 
         optimizer.zero_grad()
         loss.backward()
@@ -290,7 +330,7 @@ def evaluate(
 
             pred_embedding = latent_model(src_embedding, src_stage)
             pred_image = decoder(src_image, pred_embedding, src_stage)
-            _, metrics = compute_loss(pred_image, tgt_image, src_stage, lpips_model, args)
+            _, metrics = compute_loss(src_image, pred_image, tgt_image, src_stage, lpips_model, args)
             losses.append(metrics)
 
             per_sample_l1 = torch.mean(torch.abs(pred_image - tgt_image), dim=(1, 2, 3)).detach().cpu().numpy()
@@ -374,6 +414,8 @@ def main() -> None:
         base_channels=args.base_channels,
         stage_embed_dim=args.stage_embed_dim,
         cond_dim=args.cond_dim,
+        output_mode=args.output_mode,
+        residual_scale=args.residual_scale,
     ).to(device)
     lpips_model = build_lpips(args.lpips_weight, device)
     optimizer = torch.optim.AdamW(decoder.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -423,6 +465,8 @@ def main() -> None:
             "stage_embed_dim": args.stage_embed_dim,
             "cond_dim": args.cond_dim,
             "image_size": args.image_size,
+            "output_mode": args.output_mode,
+            "residual_scale": args.residual_scale,
         },
     }
     torch.save(checkpoint, output_dir / "best_pixel_decoder.pt")
@@ -445,6 +489,10 @@ def main() -> None:
             "lpips": args.lpips_weight,
             "edge": args.edge_weight,
             "edge_max_stage": args.edge_max_stage,
+            "change": args.change_weight,
+            "foreground": args.foreground_weight,
+            "change_threshold": args.change_threshold,
+            "foreground_threshold": args.foreground_threshold,
         },
         "num_train": len(splits["train"]),
         "num_val": len(splits["val"]),

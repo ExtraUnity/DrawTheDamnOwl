@@ -161,7 +161,10 @@ python scripts/train_pixel_decoder.py \
 	--transitions-csv data/owl_output/learning/manifest_transitions.csv \
 	--latent-checkpoint data/owl_output/learning/ar_baseline/best_model.pt \
 	--latent-metrics-json data/owl_output/learning/ar_baseline/metrics.json \
-	--output-dir data/owl_output/learning/pixel_decoder
+	--output-dir data/owl_output/learning/pixel_decoder \
+	--output-mode residual \
+	--change-weight 8.0 \
+	--foreground-weight 2.0
 ```
 
 Run pixel-space rollout with the trained decoder:
@@ -174,6 +177,7 @@ python scripts/infer_transition_rollout.py data/owl_output/stage_00_base/owl_23_
 	--embeddings-npz data/owl_output/learning/embeddings/clip_embeddings_all.npz \
 	--manifest-frames data/owl_output/learning/manifest_frames.csv \
 	--output-dir data/owl_output/learning/inference_pixel \
+	--use-retrieved-embedding \
 	--save-retrieval-fallback
 ```
 

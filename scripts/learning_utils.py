@@ -162,8 +162,14 @@ class PixelDecoderUNet(nn.Module):
         base_channels: int = 32,
         stage_embed_dim: int = 16,
         cond_dim: int = 256,
+        output_mode: str = "residual",
+        residual_scale: float = 1.0,
     ):
         super().__init__()
+        if output_mode not in {"direct", "residual"}:
+            raise ValueError("output_mode must be 'direct' or 'residual'")
+        self.output_mode = output_mode
+        self.residual_scale = float(residual_scale)
         self.stage_embed = nn.Embedding(num_stages, stage_embed_dim)
         self.cond_mlp = nn.Sequential(
             nn.Linear(embedding_dim + stage_embed_dim, cond_dim),
@@ -203,7 +209,11 @@ class PixelDecoderUNet(nn.Module):
         u1 = F.interpolate(d2, size=e1.shape[-2:], mode="bilinear", align_corners=False)
         u1 = self.up1(u1)
         d1 = self.dec1(torch.cat([u1, e1], dim=1), cond)
-        return torch.sigmoid(self.out(d1))
+        raw = self.out(d1)
+        if self.output_mode == "direct":
+            return torch.sigmoid(raw)
+        delta = torch.tanh(raw) * self.residual_scale
+        return torch.clamp(src_image + delta, 0.0, 1.0)
 
 
 def image_to_tensor(image: Image.Image, image_size: int) -> torch.Tensor:

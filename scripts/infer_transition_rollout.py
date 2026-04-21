@@ -241,6 +241,8 @@ def load_pixel_decoder(checkpoint_path: Path, device: torch.device) -> Tuple[Pix
         base_channels=int(config.get("base_channels", 32)),
         stage_embed_dim=int(config.get("stage_embed_dim", 16)),
         cond_dim=int(config.get("cond_dim", 256)),
+        output_mode=str(config.get("output_mode", "direct")),
+        residual_scale=float(config.get("residual_scale", 1.0)),
     ).to(device)
 
     state = checkpoint.get("model_state_dict", checkpoint)
@@ -261,6 +263,7 @@ def rollout_stages_with_pixel_decoder(
     device: torch.device,
     image_size: int,
     save_retrieval_fallback: bool,
+    use_retrieved_embedding: bool,
 ) -> List[Dict[str, object]]:
     rollout: List[Dict[str, object]] = []
 
@@ -287,26 +290,32 @@ def rollout_stages_with_pixel_decoder(
             "generated_image_path": str(generated_path),
         }
 
-        if save_retrieval_fallback:
+        match = None
+        if save_retrieval_fallback or use_retrieved_embedding:
             match = retrieve_nearest(pred_np, stage_bank[predicted_stage])
-            retrieved_path = Path(match["image_path"])
-            require_file(retrieved_path, "Retrieved image")
-            copied_name = f"stage_{predicted_stage:02d}_retrieval_{match['frame_key']}{retrieved_path.suffix}"
-            copied_path = output_dir / copied_name
-            shutil.copy2(retrieved_path, copied_path)
             step.update(
                 {
                     "retrieved_frame_key": match["frame_key"],
                     "retrieved_stem": match["stem"],
                     "retrieved_split": match["split"],
-                    "retrieved_image_path": str(retrieved_path),
-                    "copied_image_path": str(copied_path),
                     "retrieval_cosine": float(match["cosine"]),
                 }
             )
+            if save_retrieval_fallback:
+                retrieved_path = Path(match["image_path"])
+                require_file(retrieved_path, "Retrieved image")
+                copied_name = f"stage_{predicted_stage:02d}_retrieval_{match['frame_key']}{retrieved_path.suffix}"
+                copied_path = output_dir / copied_name
+                shutil.copy2(retrieved_path, copied_path)
+                step.update(
+                    {
+                        "retrieved_image_path": str(retrieved_path),
+                        "copied_image_path": str(copied_path),
+                    }
+                )
 
         rollout.append(step)
-        current_embedding = pred_np
+        current_embedding = np.asarray(match["embedding"] if use_retrieved_embedding and match is not None else pred_np, dtype=np.float32)
         current_image = generated.detach()
 
     return rollout
@@ -355,6 +364,7 @@ def main() -> None:
             device=device,
             image_size=image_size,
             save_retrieval_fallback=args.save_retrieval_fallback,
+            use_retrieved_embedding=args.use_retrieved_embedding,
         )
     else:
         rollout = rollout_stages(
