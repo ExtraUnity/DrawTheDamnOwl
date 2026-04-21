@@ -194,7 +194,13 @@ class PixelDecoderUNet(nn.Module):
         self.dec1 = FiLMBlock(c2 + c1, c1, cond_dim)
         self.out = nn.Conv2d(c1, 3, kernel_size=1)
 
-    def forward(self, src_image: torch.Tensor, target_embedding: torch.Tensor, src_stage_idx: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        src_image: torch.Tensor,
+        target_embedding: torch.Tensor,
+        src_stage_idx: torch.Tensor,
+        return_delta: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         stage_vec = self.stage_embed(src_stage_idx)
         cond = self.cond_mlp(torch.cat([target_embedding, stage_vec], dim=-1))
 
@@ -211,9 +217,14 @@ class PixelDecoderUNet(nn.Module):
         d1 = self.dec1(torch.cat([u1, e1], dim=1), cond)
         raw = self.out(d1)
         if self.output_mode == "direct":
-            return torch.sigmoid(raw)
-        delta = torch.tanh(raw) * self.residual_scale
-        return torch.clamp(src_image + delta, 0.0, 1.0)
+            pred = torch.sigmoid(raw)
+            delta = pred - src_image
+        else:
+            delta = torch.tanh(raw) * self.residual_scale
+            pred = torch.clamp(src_image + delta, 0.0, 1.0)
+        if return_delta:
+            return pred, delta
+        return pred
 
 
 def image_to_tensor(image: Image.Image, image_size: int) -> torch.Tensor:

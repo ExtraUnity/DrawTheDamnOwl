@@ -68,6 +68,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--residual-scale", type=float, default=1.0, help="Maximum residual delta magnitude")
     parser.add_argument("--l1-weight", type=float, default=1.0, help="L1 reconstruction loss weight")
+    parser.add_argument(
+        "--delta-weight",
+        type=float,
+        default=5.0,
+        help="Loss weight for predicting the actual target-source image delta",
+    )
     parser.add_argument("--ssim-weight", type=float, default=0.5, help="SSIM loss weight")
     parser.add_argument("--lpips-weight", type=float, default=0.0, help="LPIPS loss weight; requires lpips package")
     parser.add_argument("--edge-weight", type=float, default=0.2, help="Sobel edge loss weight")
@@ -86,6 +92,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--change-threshold", type=float, default=0.03, help="Pixel-change threshold for weighted L1")
     parser.add_argument("--foreground-threshold", type=float, default=0.05, help="Target luminance threshold for weighted L1")
+    parser.add_argument(
+        "--delta-change-weight",
+        type=float,
+        default=16.0,
+        help="Extra delta loss weight on pixels that should change",
+    )
+    parser.add_argument(
+        "--conditioning-mode",
+        choices=["predicted", "target", "mix"],
+        default="mix",
+        help="Condition decoder on predicted latents, true target latents, or a training mix",
+    )
+    parser.add_argument(
+        "--target-conditioning-prob",
+        type=float,
+        default=0.5,
+        help="Probability of true target latent conditioning when --conditioning-mode mix",
+    )
     parser.add_argument("--patience", type=int, default=15, help="Early stopping patience on validation loss")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader worker count")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -217,13 +241,15 @@ def build_lpips(weight: float, device: torch.device):
 def compute_loss(
     src: torch.Tensor,
     pred: torch.Tensor,
+    pred_delta: torch.Tensor,
     target: torch.Tensor,
     src_stage: torch.Tensor,
     lpips_model,
     args: argparse.Namespace,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    target_delta = target - src
     per_pixel_l1 = torch.abs(pred - target)
-    change = torch.mean(torch.abs(target - src), dim=1, keepdim=True) > float(args.change_threshold)
+    change = torch.mean(torch.abs(target_delta), dim=1, keepdim=True) > float(args.change_threshold)
     target_luma = 0.299 * target[:, 0:1] + 0.587 * target[:, 1:2] + 0.114 * target[:, 2:3]
     foreground = target_luma > float(args.foreground_threshold)
     weights = (
@@ -233,6 +259,8 @@ def compute_loss(
     )
     l1 = torch.mean(per_pixel_l1 * weights)
     unweighted_l1 = F.l1_loss(pred, target)
+    delta_weights = 1.0 + float(args.delta_change_weight) * change.to(dtype=pred.dtype)
+    delta_l1 = torch.mean(torch.abs(pred_delta - target_delta) * delta_weights)
     ssim = ssim_loss(pred, target)
 
     early_mask = src_stage <= int(args.edge_max_stage)
@@ -248,6 +276,7 @@ def compute_loss(
 
     total = (
         float(args.l1_weight) * l1
+        + float(args.delta_weight) * delta_l1
         + float(args.ssim_weight) * ssim
         + float(args.edge_weight) * edge
         + float(args.lpips_weight) * lpips_value
@@ -256,6 +285,7 @@ def compute_loss(
         "loss": float(total.detach().cpu().item()),
         "l1": float(l1.detach().cpu().item()),
         "unweighted_l1": float(unweighted_l1.detach().cpu().item()),
+        "delta_l1": float(delta_l1.detach().cpu().item()),
         "ssim": float(ssim.detach().cpu().item()),
         "edge": float(edge.detach().cpu().item()),
         "lpips": float(lpips_value.detach().cpu().item()),
@@ -268,12 +298,39 @@ def mean_metrics(values: List[Dict[str, float]]) -> Dict[str, float]:
             "loss": float("nan"),
             "l1": float("nan"),
             "unweighted_l1": float("nan"),
+            "delta_l1": float("nan"),
             "ssim": float("nan"),
             "edge": float("nan"),
             "lpips": float("nan"),
         }
     keys = values[0].keys()
     return {key: float(np.mean([item[key] for item in values])) for key in keys}
+
+
+def choose_condition_embedding(
+    latent_model: nn.Module,
+    src_embedding: torch.Tensor,
+    tgt_embedding: torch.Tensor,
+    src_stage: torch.Tensor,
+    args: argparse.Namespace,
+    training: bool,
+) -> torch.Tensor:
+    with torch.no_grad():
+        pred_embedding = latent_model(src_embedding, src_stage)
+
+    if args.conditioning_mode == "predicted" or not training:
+        return pred_embedding
+    if args.conditioning_mode == "target":
+        return tgt_embedding
+
+    prob = float(args.target_conditioning_prob)
+    if prob <= 0.0:
+        return pred_embedding
+    if prob >= 1.0:
+        return tgt_embedding
+
+    mask = torch.rand((src_embedding.shape[0], 1), device=src_embedding.device) < prob
+    return torch.where(mask, tgt_embedding, pred_embedding)
 
 
 def train_one_epoch(
@@ -292,13 +349,12 @@ def train_one_epoch(
         src_image = batch["src_image"].to(device)
         tgt_image = batch["tgt_image"].to(device)
         src_embedding = batch["src_embedding"].to(device)
+        tgt_embedding = batch["tgt_embedding"].to(device)
         src_stage = batch["src_stage_idx"].to(device)
 
-        with torch.no_grad():
-            pred_embedding = latent_model(src_embedding, src_stage)
-
-        pred_image = decoder(src_image, pred_embedding, src_stage)
-        loss, metrics = compute_loss(src_image, pred_image, tgt_image, src_stage, lpips_model, args)
+        cond_embedding = choose_condition_embedding(latent_model, src_embedding, tgt_embedding, src_stage, args, training=True)
+        pred_image, pred_delta = decoder(src_image, cond_embedding, src_stage, return_delta=True)
+        loss, metrics = compute_loss(src_image, pred_image, pred_delta, tgt_image, src_stage, lpips_model, args)
 
         optimizer.zero_grad()
         loss.backward()
@@ -325,12 +381,13 @@ def evaluate(
             src_image = batch["src_image"].to(device)
             tgt_image = batch["tgt_image"].to(device)
             src_embedding = batch["src_embedding"].to(device)
+            tgt_embedding = batch["tgt_embedding"].to(device)
             src_stage = batch["src_stage_idx"].to(device)
             tgt_stage = batch["tgt_stage_idx"].to(device)
 
-            pred_embedding = latent_model(src_embedding, src_stage)
-            pred_image = decoder(src_image, pred_embedding, src_stage)
-            _, metrics = compute_loss(src_image, pred_image, tgt_image, src_stage, lpips_model, args)
+            cond_embedding = choose_condition_embedding(latent_model, src_embedding, tgt_embedding, src_stage, args, training=False)
+            pred_image, pred_delta = decoder(src_image, cond_embedding, src_stage, return_delta=True)
+            _, metrics = compute_loss(src_image, pred_image, pred_delta, tgt_image, src_stage, lpips_model, args)
             losses.append(metrics)
 
             per_sample_l1 = torch.mean(torch.abs(pred_image - tgt_image), dim=(1, 2, 3)).detach().cpu().numpy()
@@ -359,7 +416,7 @@ def save_sample_sheet(
 
     tile_size = 160
     label_height = 22
-    sheet = Image.new("RGB", (tile_size * 3, count * (tile_size + label_height)), color=(255, 255, 255))
+    sheet = Image.new("RGB", (tile_size * 4, count * (tile_size + label_height)), color=(255, 255, 255))
     draw = ImageDraw.Draw(sheet)
 
     with torch.no_grad():
@@ -367,16 +424,20 @@ def save_sample_sheet(
             sample = dataset[row_idx]
             src_image = sample["src_image"].unsqueeze(0).to(device)
             src_embedding = sample["src_embedding"].unsqueeze(0).to(device)
+            tgt_embedding = sample["tgt_embedding"].unsqueeze(0).to(device)
             src_stage = sample["src_stage_idx"].view(1).to(device)
-            pred_embedding = latent_model(src_embedding, src_stage)
-            pred_image = decoder(src_image, pred_embedding, src_stage)[0]
+            cond_embedding = choose_condition_embedding(latent_model, src_embedding, tgt_embedding, src_stage, argparse.Namespace(conditioning_mode="predicted"), training=False)
+            pred_image, pred_delta = decoder(src_image, cond_embedding, src_stage, return_delta=True)
+            pred_image = pred_image[0]
+            pred_delta_vis = torch.clamp(pred_delta[0] * 0.5 + 0.5, 0.0, 1.0)
 
             images = [
                 tensor_to_pil(sample["src_image"]),
                 tensor_to_pil(pred_image),
                 tensor_to_pil(sample["tgt_image"]),
+                tensor_to_pil(pred_delta_vis),
             ]
-            labels = ["source", "predicted", "target"]
+            labels = ["source", "predicted", "target", "delta"]
             y = row_idx * (tile_size + label_height)
             for col_idx, (image, label) in enumerate(zip(images, labels)):
                 image = image.resize((tile_size, tile_size), Image.BICUBIC)
@@ -446,7 +507,8 @@ def main() -> None:
             f"epoch {epoch:03d} "
             f"train_loss={train_metrics['loss']:.4f} "
             f"val_loss={val_metrics['loss']:.4f} "
-            f"val_l1={val_metrics['l1']:.4f}"
+            f"val_l1={val_metrics['l1']:.4f} "
+            f"val_delta={val_metrics['delta_l1']:.4f}"
         )
 
         if epochs_without_improvement >= args.patience:
@@ -485,6 +547,7 @@ def main() -> None:
         "model_config": checkpoint["model_config"],
         "loss_weights": {
             "l1": args.l1_weight,
+            "delta": args.delta_weight,
             "ssim": args.ssim_weight,
             "lpips": args.lpips_weight,
             "edge": args.edge_weight,
@@ -493,6 +556,9 @@ def main() -> None:
             "foreground": args.foreground_weight,
             "change_threshold": args.change_threshold,
             "foreground_threshold": args.foreground_threshold,
+            "delta_change": args.delta_change_weight,
+            "conditioning_mode": args.conditioning_mode,
+            "target_conditioning_prob": args.target_conditioning_prob,
         },
         "num_train": len(splits["train"]),
         "num_val": len(splits["val"]),

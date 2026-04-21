@@ -164,7 +164,10 @@ python scripts/train_pixel_decoder.py \
 	--output-dir data/owl_output/learning/pixel_decoder \
 	--output-mode residual \
 	--change-weight 8.0 \
-	--foreground-weight 2.0
+	--foreground-weight 2.0 \
+	--delta-weight 5.0 \
+	--delta-change-weight 16.0 \
+	--conditioning-mode mix
 ```
 
 Run pixel-space rollout with the trained decoder:
