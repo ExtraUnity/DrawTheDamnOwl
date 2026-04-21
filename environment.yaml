@@ -1,0 +1,26 @@
+name: draw-the-damn-owl
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - pillow
+  - opencv
+  - matplotlib
+  - pytorch
+  - torchvision
+  - cpuonly
+  - transformers
+  - tqdm
+  - pip:
+      # Optional perceptual loss for scripts/train_pixel_decoder.py when --lpips-weight > 0.
+      - lpips
+
+# GPU setup:
+# This file defaults to CPU for portability. For NVIDIA CUDA training, remove
+# "cpuonly" above and install the matching PyTorch CUDA package for your driver,
+# for example:
+#   conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia

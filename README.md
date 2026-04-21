@@ -150,11 +150,31 @@ python scripts/train_transition_baseline.py \
 Run latent rollout inference from a rough sketch and retrieve nearest stage images:
 
 ```bash
-python scripts/infer_transition_rollout.py path/to/rough_sketch.png \
+python scripts/infer_transition_rollout.py data/owl_output/stage_00_base/owl_23_stage00.png --checkpoint data/owl_output/learning/ar_baseline/best_model.pt --embeddings-npz data/owl_output/learning/embeddings/clip_embeddings_all.npz --manifest-frames data/owl_output/learning/manifest_frames.csv --output-dir data/owl_output/learning/inference
+```
+
+Train a one-step pixel decoder conditioned on the current stage image, predicted next-stage latent, and stage index:
+
+```bash
+python scripts/train_pixel_decoder.py \
+	--embeddings-npz data/owl_output/learning/embeddings/clip_embeddings_all.npz \
+	--transitions-csv data/owl_output/learning/manifest_transitions.csv \
+	--latent-checkpoint data/owl_output/learning/ar_baseline/best_model.pt \
+	--latent-metrics-json data/owl_output/learning/ar_baseline/metrics.json \
+	--output-dir data/owl_output/learning/pixel_decoder
+```
+
+Run pixel-space rollout with the trained decoder:
+
+```bash
+python scripts/infer_transition_rollout.py data/owl_output/stage_00_base/owl_23_stage00.png \
+	--render-mode pixel \
 	--checkpoint data/owl_output/learning/ar_baseline/best_model.pt \
+	--pixel-decoder-checkpoint data/owl_output/learning/pixel_decoder/best_pixel_decoder.pt \
 	--embeddings-npz data/owl_output/learning/embeddings/clip_embeddings_all.npz \
 	--manifest-frames data/owl_output/learning/manifest_frames.csv \
-	--output-dir data/owl_output/learning/inference
+	--output-dir data/owl_output/learning/inference_pixel \
+	--save-retrieval-fallback
 ```
 
 Primary artifacts:

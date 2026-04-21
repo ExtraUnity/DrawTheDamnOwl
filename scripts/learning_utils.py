@@ -1,9 +1,10 @@
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torch import nn
 
@@ -123,6 +124,139 @@ class TransitionMLP(nn.Module):
         pred_delta = self.net(torch.cat([src_embedding, stage_vec], dim=-1))
         pred = src_embedding + pred_delta
         return torch.nn.functional.normalize(pred, p=2, dim=-1)
+
+
+def _group_count(channels: int, preferred: int = 8) -> int:
+    for groups in range(min(preferred, channels), 0, -1):
+        if channels % groups == 0:
+            return groups
+    return 1
+
+
+class FiLMBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, cond_dim: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.norm1 = nn.GroupNorm(num_groups=_group_count(out_channels), num_channels=out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.norm2 = nn.GroupNorm(num_groups=_group_count(out_channels), num_channels=out_channels)
+        self.cond = nn.Linear(cond_dim, out_channels * 2)
+        self.skip = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        residual = self.skip(x)
+        h = self.norm1(self.conv1(x))
+        scale_shift = self.cond(cond).unsqueeze(-1).unsqueeze(-1)
+        scale, shift = scale_shift.chunk(2, dim=1)
+        h = h * (1.0 + scale) + shift
+        h = F.silu(h)
+        h = F.silu(self.norm2(self.conv2(h)))
+        return h + residual
+
+
+class PixelDecoderUNet(nn.Module):
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_stages: int,
+        base_channels: int = 32,
+        stage_embed_dim: int = 16,
+        cond_dim: int = 256,
+    ):
+        super().__init__()
+        self.stage_embed = nn.Embedding(num_stages, stage_embed_dim)
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(embedding_dim + stage_embed_dim, cond_dim),
+            nn.SiLU(),
+            nn.Linear(cond_dim, cond_dim),
+            nn.SiLU(),
+        )
+
+        c1 = base_channels
+        c2 = base_channels * 2
+        c3 = base_channels * 4
+        c4 = base_channels * 8
+
+        self.enc1 = FiLMBlock(3, c1, cond_dim)
+        self.down1 = nn.Conv2d(c1, c2, kernel_size=4, stride=2, padding=1)
+        self.enc2 = FiLMBlock(c2, c2, cond_dim)
+        self.down2 = nn.Conv2d(c2, c3, kernel_size=4, stride=2, padding=1)
+        self.bottleneck = FiLMBlock(c3, c4, cond_dim)
+        self.up2 = nn.Conv2d(c4, c3, kernel_size=3, padding=1)
+        self.dec2 = FiLMBlock(c3 + c2, c2, cond_dim)
+        self.up1 = nn.Conv2d(c2, c2, kernel_size=3, padding=1)
+        self.dec1 = FiLMBlock(c2 + c1, c1, cond_dim)
+        self.out = nn.Conv2d(c1, 3, kernel_size=1)
+
+    def forward(self, src_image: torch.Tensor, target_embedding: torch.Tensor, src_stage_idx: torch.Tensor) -> torch.Tensor:
+        stage_vec = self.stage_embed(src_stage_idx)
+        cond = self.cond_mlp(torch.cat([target_embedding, stage_vec], dim=-1))
+
+        e1 = self.enc1(src_image, cond)
+        e2 = self.enc2(self.down1(e1), cond)
+        b = self.bottleneck(self.down2(e2), cond)
+
+        u2 = F.interpolate(b, size=e2.shape[-2:], mode="bilinear", align_corners=False)
+        u2 = self.up2(u2)
+        d2 = self.dec2(torch.cat([u2, e2], dim=1), cond)
+
+        u1 = F.interpolate(d2, size=e1.shape[-2:], mode="bilinear", align_corners=False)
+        u1 = self.up1(u1)
+        d1 = self.dec1(torch.cat([u1, e1], dim=1), cond)
+        return torch.sigmoid(self.out(d1))
+
+
+def image_to_tensor(image: Image.Image, image_size: int) -> torch.Tensor:
+    rgb = image.convert("RGB").resize((image_size, image_size), Image.BICUBIC)
+    array = np.asarray(rgb, dtype=np.float32) / 255.0
+    return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+
+
+def tensor_to_pil(image: torch.Tensor) -> Image.Image:
+    image = image.detach().cpu().clamp(0.0, 1.0)
+    array = (image.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
+    return Image.fromarray(array, mode="RGB")
+
+
+def ssim_loss(pred: torch.Tensor, target: torch.Tensor, window_size: int = 11) -> torch.Tensor:
+    channels = pred.shape[1]
+    padding = window_size // 2
+    kernel = torch.ones((channels, 1, window_size, window_size), dtype=pred.dtype, device=pred.device)
+    kernel = kernel / float(window_size * window_size)
+
+    mu_pred = F.conv2d(pred, kernel, padding=padding, groups=channels)
+    mu_target = F.conv2d(target, kernel, padding=padding, groups=channels)
+    sigma_pred = F.conv2d(pred * pred, kernel, padding=padding, groups=channels) - mu_pred * mu_pred
+    sigma_target = F.conv2d(target * target, kernel, padding=padding, groups=channels) - mu_target * mu_target
+    sigma_cross = F.conv2d(pred * target, kernel, padding=padding, groups=channels) - mu_pred * mu_target
+
+    c1 = 0.01**2
+    c2 = 0.03**2
+    ssim = ((2.0 * mu_pred * mu_target + c1) * (2.0 * sigma_cross + c2)) / (
+        (mu_pred * mu_pred + mu_target * mu_target + c1) * (sigma_pred + sigma_target + c2)
+    )
+    return 1.0 - ssim.mean()
+
+
+def sobel_edges(image: torch.Tensor) -> torch.Tensor:
+    gray = 0.299 * image[:, 0:1] + 0.587 * image[:, 1:2] + 0.114 * image[:, 2:3]
+    kx = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], device=image.device, dtype=image.dtype)
+    ky = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]], device=image.device, dtype=image.dtype)
+    gx = F.conv2d(gray, kx.view(1, 1, 3, 3), padding=1)
+    gy = F.conv2d(gray, ky.view(1, 1, 3, 3), padding=1)
+    return torch.sqrt(gx * gx + gy * gy + 1e-6)
+
+
+def center_crop_to_match(a: torch.Tensor, b: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    height = min(a.shape[-2], b.shape[-2])
+    width = min(a.shape[-1], b.shape[-1])
+
+    def crop(x: torch.Tensor) -> torch.Tensor:
+        top = (x.shape[-2] - height) // 2
+        left = (x.shape[-1] - width) // 2
+        return x[..., top : top + height, left : left + width]
+
+    return crop(a), crop(b)
 
 
 def load_model_config(metrics_path: Path) -> Dict[str, Any]:

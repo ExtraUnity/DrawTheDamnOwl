@@ -8,12 +8,15 @@ import torch
 from PIL import Image, ImageDraw, ImageOps
 
 from learning_utils import (
+    PixelDecoderUNet,
     TransitionMLP,
     default_device,
     embed_image_with_clip,
+    image_to_tensor,
     load_checkpoint_state,
     load_embedding_archive,
     load_model_config,
+    tensor_to_pil,
 )
 from script_utils import LEARNING_ROOT, ensure_dir, read_csv_rows, require_file, write_json
 
@@ -45,6 +48,22 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         default=str(LEARNING_ROOT / "inference"),
         help="Output directory for rollout artifacts",
+    )
+    parser.add_argument(
+        "--render-mode",
+        choices=["retrieval", "pixel"],
+        default="retrieval",
+        help="Use nearest-neighbor retrieval or the trained pixel decoder for stage images",
+    )
+    parser.add_argument(
+        "--pixel-decoder-checkpoint",
+        default=str(LEARNING_ROOT / "pixel_decoder" / "best_pixel_decoder.pt"),
+        help="Path to trained pixel decoder checkpoint from train_pixel_decoder.py",
+    )
+    parser.add_argument(
+        "--save-retrieval-fallback",
+        action="store_true",
+        help="In pixel mode, also save nearest retrieved stage images for side-by-side comparison",
     )
     parser.add_argument("--model-id", default="openai/clip-vit-base-patch32", help="Hugging Face CLIP model id")
     parser.add_argument("--device", default=default_device(), help="Inference device")
@@ -129,7 +148,8 @@ def build_contact_sheet(input_image: Path, rollout: List[Dict[str, object]], out
     labels.append("input")
 
     for step in rollout:
-        with Image.open(step["retrieved_image_path"]) as image:
+        image_path = step.get("generated_image_path") or step.get("copied_image_path") or step["retrieved_image_path"]
+        with Image.open(str(image_path)) as image:
             images.append(ImageOps.contain(image.convert("RGB"), (tile_size, tile_size)))
         labels.append(f"stage {step['predicted_stage']}")
 
@@ -208,6 +228,90 @@ def rollout_stages(
     return rollout
 
 
+def load_pixel_decoder(checkpoint_path: Path, device: torch.device) -> Tuple[PixelDecoderUNet, Dict[str, object]]:
+    require_file(checkpoint_path, "Pixel decoder checkpoint")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if not isinstance(checkpoint, dict) or "model_config" not in checkpoint:
+        raise RuntimeError(f"Pixel decoder checkpoint is missing model_config: {checkpoint_path}")
+
+    config = dict(checkpoint["model_config"])
+    model = PixelDecoderUNet(
+        embedding_dim=int(config["embedding_dim"]),
+        num_stages=int(config["num_stages"]),
+        base_channels=int(config.get("base_channels", 32)),
+        stage_embed_dim=int(config.get("stage_embed_dim", 16)),
+        cond_dim=int(config.get("cond_dim", 256)),
+    ).to(device)
+
+    state = checkpoint.get("model_state_dict", checkpoint)
+    model.load_state_dict(state)
+    model.eval()
+    return model, config
+
+
+def rollout_stages_with_pixel_decoder(
+    model: TransitionMLP,
+    pixel_decoder: PixelDecoderUNet,
+    current_embedding: np.ndarray,
+    input_image: Path,
+    stage_bank: Dict[int, Dict[str, object]],
+    start_stage: int,
+    end_stage: int,
+    output_dir: Path,
+    device: torch.device,
+    image_size: int,
+    save_retrieval_fallback: bool,
+) -> List[Dict[str, object]]:
+    rollout: List[Dict[str, object]] = []
+
+    with Image.open(input_image) as image:
+        current_image = image_to_tensor(image, image_size).to(device)
+
+    for src_stage in range(start_stage, end_stage):
+        src_tensor = torch.from_numpy(current_embedding).unsqueeze(0).to(device)
+        src_stage_tensor = torch.tensor([src_stage], dtype=torch.long, device=device)
+
+        with torch.no_grad():
+            pred = model(src_tensor, src_stage_tensor)
+            pred_np = pred[0].detach().cpu().numpy().astype(np.float32)
+            pred_np /= max(float(np.linalg.norm(pred_np)), 1e-12)
+            generated = pixel_decoder(current_image.unsqueeze(0), pred, src_stage_tensor)[0]
+
+        predicted_stage = src_stage + 1
+        generated_path = output_dir / f"stage_{predicted_stage:02d}_generated.png"
+        tensor_to_pil(generated).save(generated_path)
+
+        step: Dict[str, object] = {
+            "source_stage": src_stage,
+            "predicted_stage": predicted_stage,
+            "generated_image_path": str(generated_path),
+        }
+
+        if save_retrieval_fallback:
+            match = retrieve_nearest(pred_np, stage_bank[predicted_stage])
+            retrieved_path = Path(match["image_path"])
+            require_file(retrieved_path, "Retrieved image")
+            copied_name = f"stage_{predicted_stage:02d}_retrieval_{match['frame_key']}{retrieved_path.suffix}"
+            copied_path = output_dir / copied_name
+            shutil.copy2(retrieved_path, copied_path)
+            step.update(
+                {
+                    "retrieved_frame_key": match["frame_key"],
+                    "retrieved_stem": match["stem"],
+                    "retrieved_split": match["split"],
+                    "retrieved_image_path": str(retrieved_path),
+                    "copied_image_path": str(copied_path),
+                    "retrieval_cosine": float(match["cosine"]),
+                }
+            )
+
+        rollout.append(step)
+        current_embedding = pred_np
+        current_image = generated.detach()
+
+    return rollout
+
+
 def main() -> None:
     args = parse_args()
     input_image = Path(args.input_image)
@@ -235,26 +339,48 @@ def main() -> None:
     model.eval()
 
     current_embedding = embed_image_with_clip(input_image, args.model_id, device)
-    rollout = rollout_stages(
-        model=model,
-        current_embedding=current_embedding,
-        stage_bank=stage_bank,
-        start_stage=args.start_stage,
-        end_stage=args.end_stage,
-        output_dir=output_dir,
-        device=device,
-        use_retrieved_embedding=args.use_retrieved_embedding,
-    )
+    pixel_decoder_config = None
+    if args.render_mode == "pixel":
+        pixel_decoder, pixel_decoder_config = load_pixel_decoder(Path(args.pixel_decoder_checkpoint), device)
+        image_size = int(pixel_decoder_config.get("image_size", 256))
+        rollout = rollout_stages_with_pixel_decoder(
+            model=model,
+            pixel_decoder=pixel_decoder,
+            current_embedding=current_embedding,
+            input_image=input_image,
+            stage_bank=stage_bank,
+            start_stage=args.start_stage,
+            end_stage=args.end_stage,
+            output_dir=output_dir,
+            device=device,
+            image_size=image_size,
+            save_retrieval_fallback=args.save_retrieval_fallback,
+        )
+    else:
+        rollout = rollout_stages(
+            model=model,
+            current_embedding=current_embedding,
+            stage_bank=stage_bank,
+            start_stage=args.start_stage,
+            end_stage=args.end_stage,
+            output_dir=output_dir,
+            device=device,
+            use_retrieved_embedding=args.use_retrieved_embedding,
+        )
 
     summary = {
         "input_image": str(input_image),
         "checkpoint": str(checkpoint),
+        "render_mode": args.render_mode,
+        "pixel_decoder_checkpoint": args.pixel_decoder_checkpoint if args.render_mode == "pixel" else None,
+        "pixel_decoder_config": pixel_decoder_config,
         "model_id": args.model_id,
         "device": str(device),
         "start_stage": args.start_stage,
         "end_stage": args.end_stage,
         "retrieval_split": args.retrieval_split,
         "use_retrieved_embedding": bool(args.use_retrieved_embedding),
+        "save_retrieval_fallback": bool(args.save_retrieval_fallback),
         "rollout": rollout,
     }
 
