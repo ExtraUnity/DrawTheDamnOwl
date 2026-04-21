@@ -95,6 +95,76 @@ Custom root (if your dataset root differs):
 python data_pipeline.py --data-root data/owl_output --stages all --overwrite
 ```
 
+## CLIP Baseline Setup
+
+The project now includes a first implementation slice for stage learning:
+
+- Build frame and transition manifests split by owl stem.
+- Extract frozen CLIP embeddings for each stage frame.
+- Run stage-level embedding diagnostics (clusterability and similarity).
+
+Install dependencies:
+
+```bash
+pip install numpy torch transformers pillow matplotlib
+```
+
+If CLIP loading fails with a `torchvision::nms` or import error, install matching PyTorch and torchvision versions (the issue is usually version mismatch):
+
+```bash
+python -m pip install --upgrade torch torchvision
+```
+
+Build manifests:
+
+```bash
+python scripts/build_manifest.py --data-root data/owl_output --output-dir data/owl_output/learning
+```
+
+Extract embeddings for all splits:
+
+```bash
+python scripts/extract_clip_embeddings.py \
+	--manifest-frames data/owl_output/learning/manifest_frames.csv \
+	--output-dir data/owl_output/learning/embeddings \
+	--split all
+```
+
+Run diagnostics:
+
+```bash
+python scripts/embedding_diagnostics.py \
+	--embeddings-npz data/owl_output/learning/embeddings/clip_embeddings_all.npz \
+	--output-dir data/owl_output/learning/diagnostics
+```
+
+Train a first latent next-stage baseline:
+
+```bash
+python scripts/train_transition_baseline.py \
+	--embeddings-npz data/owl_output/learning/embeddings/clip_embeddings_all.npz \
+	--transitions-csv data/owl_output/learning/manifest_transitions.csv \
+	--output-dir data/owl_output/learning/ar_baseline
+```
+
+Run latent rollout inference from a rough sketch and retrieve nearest stage images:
+
+```bash
+python scripts/infer_transition_rollout.py path/to/rough_sketch.png \
+	--checkpoint data/owl_output/learning/ar_baseline/best_model.pt \
+	--embeddings-npz data/owl_output/learning/embeddings/clip_embeddings_all.npz \
+	--manifest-frames data/owl_output/learning/manifest_frames.csv \
+	--output-dir data/owl_output/learning/inference
+```
+
+Primary artifacts:
+
+- `data/owl_output/learning/manifest_frames.csv`
+- `data/owl_output/learning/manifest_transitions.csv`
+- `data/owl_output/learning/manifest_qa.json`
+- `data/owl_output/learning/embeddings/clip_embeddings_all.npz`
+- `data/owl_output/learning/diagnostics/embedding_diagnostics.json`
+
 ## Notes on Stage Independence
 
 Each stage is implemented as a separate function and can run independently if required prerequisites exist.

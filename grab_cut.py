@@ -210,7 +210,13 @@ def process_single_image(image_path, output_folder, index, total):
     if img is None:
         print(f"[{index}/{total}] Could not load: {image_path}")
         return "error"
-
+    # Resize to max dimension of 512 for better performance (preserve aspect ratio)
+    h, w = img.shape[:2]
+    max_dim = max(h, w)
+    if max_dim > 512:
+        scale = 512 / max_dim
+        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    
     reset_state(img)
     current_mask = None
 
