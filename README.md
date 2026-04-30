@@ -160,3 +160,21 @@ Each stage is implemented as a separate function and can run independently if re
 - Stages `01, 02, 04, 05, 07` consume prior grayscale cumulative outputs.
 
 When prerequisites are missing, the script prints clear errors and continues with the next sample.
+
+
+## Code to run DINO embedding and CLIP embedding + diagnostics
+
+# 1. Re-extract CLIP embeddings on combined manifest
+uv run --with torch --with transformers --with pillow python scripts/extract_clip_embeddings.py --manifest-frames data/combined_learning_reduced/manifest_frames.csv --output-dir data/combined_learning_reduced/embeddings --model-id openai/clip-vit-base-patch32 --batch-size 32
+
+# 2. Re-extract DINO embeddings on combined manifest
+uv run --with timm --with torchvision --with torch --with transformers python scripts/extract_dino_embeddings.py --manifest-frames data/combined_learning_reduced/manifest_frames.csv --output-dir data/combined_learning_reduced/embeddings --model-id facebook/dinov2-base --batch-size 32
+
+# 3. Run diagnostics on DINO embeddings
+uv run --with torch --with numpy --with matplotlib python scripts/embedding_diagnostics.py --embeddings-npz data/combined_learning_reduced/embeddings/dino_embeddings_all.npz --output-dir data/combined_learning_reduced/diagnostics_dino
+
+# 4. Run diagnostics on CLIP embeddings
+uv run --with torch --with numpy --with matplotlib python scripts/embedding_diagnostics.py --embeddings-npz data/combined_learning_reduced/embeddings/clip_embeddings_all.npz --output-dir data/combined_learning_reduced/diagnostics_clip
+
+# 5. Generate UMAP/heatmaps and retrieval sheets
+uv run --with pillow --with matplotlib --with scikit-learn --with numpy python scripts/compare_embeddings_visuals.py --clip data/combined_learning_reduced/embeddings/clip_embeddings_all.npz --dino data/combined_learning_reduced/embeddings/dino_embeddings_all.npz --out-dir data/combined_learning_reduced/visuals --num-seeds 6 --topk 5
