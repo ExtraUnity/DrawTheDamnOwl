@@ -129,6 +129,7 @@ def main() -> None:
     stages = centroid["stages"]
     matrix = centroid["matrix"]
     intra = intra_cosine_series(per_stage)
+    display_stages = list(range(len(stages)))
 
     write_similarity_csv(out_dir / "stage_centroid_cosine.csv", stages, matrix)
 
@@ -139,6 +140,7 @@ def main() -> None:
         "nearest_neighbor_same_stage_accuracy": nn_acc,
         "per_stage": per_stage,
         "centroid_stages": stages,
+        "display_stages": display_stages,
         "centroid_cosine_matrix": matrix.tolist(),
     }
     write_json(out_dir / "embedding_diagnostics.json", summary)
@@ -151,10 +153,10 @@ def main() -> None:
         ax = fig.add_subplot(1, 1, 1)
         im = ax.imshow(matrix, vmin=0, vmax=1.0, cmap="viridis")
         ax.set_title("Stage Centroid Cosine Similarity")
-        ax.set_xticks(range(len(stages)))
-        ax.set_yticks(range(len(stages)))
-        ax.set_xticklabels(stages)
-        ax.set_yticklabels(stages)
+        ax.set_xticks(range(len(display_stages)))
+        ax.set_yticks(range(len(display_stages)))
+        ax.set_xticklabels(display_stages)
+        ax.set_yticklabels(display_stages)
         fig.colorbar(im, ax=ax)
         fig.tight_layout()
         fig.savefig(out_dir / "stage_centroid_cosine.png", dpi=150)
@@ -162,11 +164,11 @@ def main() -> None:
 
         fig = plt.figure(figsize=(8, 4.5))
         ax = fig.add_subplot(1, 1, 1)
-        bars = ax.bar(intra["stages"], intra["values"], color="#1f77b4", width=0.75)
+        bars = ax.bar(display_stages, intra["values"], color="#1f77b4", width=0.75)
         ax.set_title("Per-Stage Intra Cosine Similarity")
         ax.set_xlabel("Stage")
         ax.set_ylabel("Mean Intra-Stage Cosine")
-        ax.set_xticks(intra["stages"])
+        ax.set_xticks(display_stages)
         ax.set_ylim(0.0, 1.0)
         ax.grid(axis="y", linestyle="--", alpha=0.35)
 

@@ -134,22 +134,23 @@ def main() -> None:
 
     transition_rows: List[Dict[str, str]] = []
     frame_index = {(row["stem"], int(row["stage_idx"])): row for row in frame_rows}
+    adjacent_pairs = list(zip(stage_indices[:-1], stage_indices[1:]))
     for stem in split_source_stems:
         split_name = split_of_stem[stem]
-        for t in range(0, 9):
-            src = frame_index.get((stem, t))
-            tgt = frame_index.get((stem, t + 1))
+        for src_idx, tgt_idx in adjacent_pairs:
+            src = frame_index.get((stem, src_idx))
+            tgt = frame_index.get((stem, tgt_idx))
             if src is None or tgt is None:
                 continue
             transition_rows.append(
                 {
                     "stem": stem,
                     "split": split_name,
-                    "src_stage_idx": str(t),
-                    "tgt_stage_idx": str(t + 1),
+                    "src_stage_idx": str(src_idx),
+                    "tgt_stage_idx": str(tgt_idx),
                     "src_image_path": src["image_path"],
                     "tgt_image_path": tgt["image_path"],
-                    "transition_key": f"{stem}_stage{t:02d}_to_stage{t+1:02d}",
+                    "transition_key": f"{stem}_stage{src_idx:02d}_to_stage{tgt_idx:02d}",
                 }
             )
 

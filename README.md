@@ -13,18 +13,14 @@ All samples are assumed to be pre-cropped and aligned to `256x256`.
 
 ## Outputs
 
-The pipeline writes stage folders and JSON annotations:
+The pipeline writes active stage folders and JSON annotations:
 
 - `stage_00_base`
 - `stage_01_outer_contour`
 - `stage_02_facial_features`
-- `stage_03_part_boundaries`
 - `stage_04_inner_contours`
 - `stage_05_value_regions`
-- `stage_06_feather_masses`
 - `stage_07_fine_texture`
-- `stage_08_color`
-- `stage_09_background`
 - `annotations`
 
 For each stage and sample stem:
@@ -38,13 +34,9 @@ For each stage and sample stem:
 1. `base_ellipses` (Stage 00): head/body ellipse scaffold from mask split.
 2. `add_outer_contour` (Stage 01): simplified owl silhouette contour.
 3. `add_facial_features` (Stage 02): eyes and beak from upper-region heuristics.
-4. `add_part_boundaries` (Stage 03): coarse internal semantic boundaries.
-5. `add_inner_contours` (Stage 04): medium-scale internal contour structure.
-6. `add_value_regions` (Stage 05): coarse tonal zones from quantized grayscale.
-7. `add_feather_masses` (Stage 06): grouped mid-scale texture masses.
-8. `add_fine_texture` (Stage 07): high-frequency residual detail layer.
-9. `add_color` (Stage 08): chroma transfer while preserving prior structure.
-10. `add_background` (Stage 09): outside-mask background and final reconstruction.
+4. `add_inner_contours` (Stage 04): medium-scale internal contour structure.
+5. `add_value_regions` (Stage 05): coarse tonal zones from quantized grayscale.
+6. `add_fine_texture` (Stage 07): high-frequency residual detail layer.
 
 ## Modeling Note
 
@@ -53,16 +45,12 @@ Structural retrieval-friendly stages:
 - `base_ellipses`
 - `add_outer_contour`
 - `add_facial_features`
-- `add_part_boundaries`
 - `add_inner_contours`
 
 Dense/generative-oriented stages:
 
 - `add_value_regions`
-- `add_feather_masses`
 - `add_fine_texture`
-- `add_color`
-- `add_background`
 
 ## Main Files
 
@@ -169,7 +157,6 @@ Primary artifacts:
 
 Each stage is implemented as a separate function and can run independently if required prerequisites exist.
 
-- Stages `01-08` need previous grayscale cumulative output.
-- Stage `09` needs stage `08` color cumulative output.
+- Stages `01, 02, 04, 05, 07` consume prior grayscale cumulative outputs.
 
 When prerequisites are missing, the script prints clear errors and continues with the next sample.

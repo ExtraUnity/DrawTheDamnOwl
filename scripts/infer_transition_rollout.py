@@ -49,7 +49,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-id", default="openai/clip-vit-base-patch32", help="Hugging Face CLIP model id")
     parser.add_argument("--device", default=default_device(), help="Inference device")
     parser.add_argument("--start-stage", type=int, default=0, help="Stage index represented by the input sketch")
-    parser.add_argument("--end-stage", type=int, default=9, help="Final stage index to roll out to")
+    parser.add_argument(
+        "--end-stage",
+        type=int,
+        default=-1,
+        help="Final stage index to roll out to (-1 uses highest stage available in retrieval bank)",
+    )
     parser.add_argument(
         "--retrieval-split",
         choices=["train", "val", "test", "all"],
@@ -147,32 +152,45 @@ def build_contact_sheet(input_image: Path, rollout: List[Dict[str, object]], out
     sheet.save(output_path)
 
 
-def validate_stage_range(start_stage: int, end_stage: int, num_stages: int, stage_bank: Dict[int, Dict[str, object]]) -> None:
-    if start_stage >= end_stage:
-        raise ValueError("start-stage must be smaller than end-stage")
+def build_stage_chain(start_stage: int, end_stage: int, num_stages: int, stage_bank: Dict[int, Dict[str, object]]) -> List[int]:
     if start_stage < 0:
         raise ValueError("start-stage must be non-negative")
-    if end_stage >= num_stages:
+    if start_stage >= num_stages:
+        raise ValueError(f"start-stage must be smaller than num_stages ({num_stages})")
+
+    available = sorted(stage_bank.keys())
+    if not available:
+        raise RuntimeError("No stages available in retrieval bank")
+
+    resolved_end = available[-1] if end_stage < 0 else end_stage
+    if resolved_end >= num_stages:
         raise ValueError(f"end-stage must be smaller than num_stages ({num_stages})")
 
-    missing = [stage for stage in range(start_stage + 1, end_stage + 1) if stage not in stage_bank]
-    if missing:
-        raise RuntimeError(f"No retrieval bank available for stages: {missing}")
+    if start_stage not in available:
+        raise RuntimeError(f"start-stage {start_stage} is not available in retrieval bank {available}")
+    if resolved_end not in available:
+        raise RuntimeError(f"end-stage {resolved_end} is not available in retrieval bank {available}")
+
+    start_pos = available.index(start_stage)
+    end_pos = available.index(resolved_end)
+    if start_pos >= end_pos:
+        raise ValueError("start-stage must come before end-stage in the available stage sequence")
+
+    return available[start_pos : end_pos + 1]
 
 
 def rollout_stages(
     model: TransitionMLP,
     current_embedding: np.ndarray,
     stage_bank: Dict[int, Dict[str, object]],
-    start_stage: int,
-    end_stage: int,
+    stage_chain: List[int],
     output_dir: Path,
     device: torch.device,
     use_retrieved_embedding: bool,
 ) -> List[Dict[str, object]]:
     rollout: List[Dict[str, object]] = []
 
-    for src_stage in range(start_stage, end_stage):
+    for src_stage, predicted_stage in zip(stage_chain[:-1], stage_chain[1:]):
         src_tensor = torch.from_numpy(current_embedding).unsqueeze(0).to(device)
         src_stage_tensor = torch.tensor([src_stage], dtype=torch.long, device=device)
 
@@ -180,7 +198,6 @@ def rollout_stages(
             pred = model(src_tensor, src_stage_tensor)[0].detach().cpu().numpy().astype(np.float32)
 
         pred /= max(float(np.linalg.norm(pred)), 1e-12)
-        predicted_stage = src_stage + 1
 
         match = retrieve_nearest(pred, stage_bank[predicted_stage])
         retrieved_path = Path(match["image_path"])
@@ -219,7 +236,7 @@ def main() -> None:
     checkpoint = Path(args.checkpoint)
 
     stage_bank = load_frame_bank(Path(args.embeddings_npz), Path(args.manifest_frames), args.retrieval_split)
-    validate_stage_range(args.start_stage, args.end_stage, int(model_config["num_stages"]), stage_bank)
+    stage_chain = build_stage_chain(args.start_stage, args.end_stage, int(model_config["num_stages"]), stage_bank)
 
     embedding_dim = int(np.asarray(next(iter(stage_bank.values()))["embeddings"]).shape[1])
     model = TransitionMLP(
@@ -239,12 +256,13 @@ def main() -> None:
         model=model,
         current_embedding=current_embedding,
         stage_bank=stage_bank,
-        start_stage=args.start_stage,
-        end_stage=args.end_stage,
+        stage_chain=stage_chain,
         output_dir=output_dir,
         device=device,
         use_retrieved_embedding=args.use_retrieved_embedding,
     )
+
+    resolved_end_stage = stage_chain[-1]
 
     summary = {
         "input_image": str(input_image),
@@ -252,7 +270,8 @@ def main() -> None:
         "model_id": args.model_id,
         "device": str(device),
         "start_stage": args.start_stage,
-        "end_stage": args.end_stage,
+        "end_stage": resolved_end_stage,
+        "stage_chain": stage_chain,
         "retrieval_split": args.retrieval_split,
         "use_retrieved_embedding": bool(args.use_retrieved_embedding),
         "rollout": rollout,
@@ -264,7 +283,7 @@ def main() -> None:
 
     print("Transition rollout complete")
     print(f"Input:        {input_image}")
-    print(f"Stages:       {args.start_stage} -> {args.end_stage}")
+    print(f"Stages:       {stage_chain[0]} -> {stage_chain[-1]} (chain: {stage_chain})")
     print(f"Steps:        {len(rollout)}")
     print(f"Output dir:   {output_dir}")
 

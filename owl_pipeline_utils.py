@@ -14,13 +14,9 @@ STAGE_SPECS = [
     {"idx": 0, "action": "base_ellipses", "folder": "stage_00_base", "layer_name": "base_ellipses"},
     {"idx": 1, "action": "add_outer_contour", "folder": "stage_01_outer_contour", "layer_name": "outer_contour"},
     {"idx": 2, "action": "add_facial_features", "folder": "stage_02_facial_features", "layer_name": "facial_features"},
-    {"idx": 3, "action": "add_part_boundaries", "folder": "stage_03_part_boundaries", "layer_name": "part_boundaries"},
-    {"idx": 4, "action": "add_inner_contours", "folder": "stage_04_inner_contours", "layer_name": "inner_contours"},
-    {"idx": 5, "action": "add_value_regions", "folder": "stage_05_value_regions", "layer_name": "value_regions"},
-    {"idx": 6, "action": "add_feather_masses", "folder": "stage_06_feather_masses", "layer_name": "feather_masses"},
-    {"idx": 7, "action": "add_fine_texture", "folder": "stage_07_fine_texture", "layer_name": "fine_texture"},
-    {"idx": 8, "action": "add_color", "folder": "stage_08_color", "layer_name": "color"},
-    {"idx": 9, "action": "add_background", "folder": "stage_09_background", "layer_name": "background"},
+    {"idx": 3, "action": "add_inner_contours", "folder": "stage_03_inner_contours", "layer_name": "inner_contours"},
+    {"idx": 4, "action": "add_value_regions", "folder": "stage_04_value_regions", "layer_name": "value_regions"},
+    {"idx": 5, "action": "add_fine_texture", "folder": "stage_05_fine_texture", "layer_name": "fine_texture"},
 ]
 
 STAGE_BY_INDEX = {spec["idx"]: spec for spec in STAGE_SPECS}
