@@ -108,6 +108,93 @@ def embed_image_with_clip(image_path: Path, model_id: str, device: torch.device)
     return features[0].detach().cpu().numpy().astype(np.float32)
 
 
+def load_dino_extractor(model_id: str, device: torch.device):
+    try:
+        import timm
+        from torchvision import transforms
+
+        model = timm.create_model(model_id, pretrained=True)
+        model.eval().to(device)
+        cfg = getattr(model, "default_cfg", {})
+        size = cfg.get("input_size", (3, 224, 224))
+        mean = cfg.get("mean", (0.485, 0.456, 0.406))
+        std = cfg.get("std", (0.229, 0.224, 0.225))
+
+        transform = transforms.Compose(
+            [
+                transforms.Resize((size[1], size[2])),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std),
+            ]
+        )
+
+        def forward(images):
+            xs = torch.stack([transform(im) for im in images], dim=0).to(device)
+            with torch.no_grad():
+                if hasattr(model, "forward_features"):
+                    feats = model.forward_features(xs)
+                else:
+                    feats = model(xs)
+            if torch.is_tensor(feats):
+                return feats
+            if isinstance(feats, dict):
+                for key in ("x_norm_clstoken", "cls_token", "pre_logits", "x"):
+                    value = feats.get(key)
+                    if torch.is_tensor(value):
+                        return value
+                for value in feats.values():
+                    if torch.is_tensor(value):
+                        return value
+            if isinstance(feats, tuple) and feats and torch.is_tensor(feats[0]):
+                return feats[0]
+            raise RuntimeError("Unsupported timm model output for features")
+
+        return forward, "timm"
+    except Exception:
+        pass
+
+    try:
+        from transformers import AutoImageProcessor, AutoModel
+
+        processor = AutoImageProcessor.from_pretrained(model_id)
+        model = AutoModel.from_pretrained(model_id).to(device)
+        model.eval()
+
+        def forward(images):
+            inputs = processor(images=images, return_tensors="pt")
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            with torch.no_grad():
+                outputs = model(**inputs)
+            if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+                return outputs.pooler_output
+            if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
+                return outputs.last_hidden_state[:, 0, :]
+            if isinstance(outputs, tuple) and outputs and torch.is_tensor(outputs[0]):
+                return outputs[0]
+            raise RuntimeError("Unsupported HF model outputs for features")
+
+        return forward, "huggingface"
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to initialize DINO model. Install 'timm' or ensure the Hugging Face model id is valid. "
+            f"Original error: {exc}"
+        ) from exc
+
+
+def embed_image_with_dino(image_path: Path, model_id: str, device: torch.device) -> np.ndarray:
+    require_file(image_path, "Input image")
+    extractor, _ = load_dino_extractor(model_id, device)
+
+    with Image.open(image_path) as image:
+        rgb_image = image.convert("RGB")
+
+    features = extractor([rgb_image])
+    if not torch.is_tensor(features):
+        features = torch.tensor(features)
+    features = torch.nn.functional.normalize(features, p=2, dim=-1)
+    return features[0].detach().cpu().numpy().astype(np.float32)
+
+
 def combine_stage_features(image_features: np.ndarray, layer_features: Optional[np.ndarray]) -> np.ndarray:
     image_vec = np.asarray(image_features, dtype=np.float32).reshape(1, -1)
     image_vec = normalize_rows(image_vec)[0]

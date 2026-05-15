@@ -14,6 +14,7 @@ from learning_utils import (
     compose_white_layer,
     default_device,
     embed_image_with_clip,
+    embed_image_with_dino,
     image_to_tensor,
     load_embedding_archive,
     load_model_config,
@@ -89,7 +90,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="In pixel mode, also save nearest retrieved stage images for side-by-side comparison",
     )
-    parser.add_argument("--model-id", default="openai/clip-vit-base-patch32", help="Hugging Face CLIP model id")
+    parser.add_argument(
+        "--embedding-backend",
+        choices=["auto", "clip", "dino"],
+        default="auto",
+        help="Encoder family used to create the embedding archive and encode the input sketch.",
+    )
+    parser.add_argument("--model-id", default="", help="Encoder model id. Leave empty to infer from metrics or backend defaults.")
     parser.add_argument("--device", default=default_device(), help="Inference device")
     parser.add_argument("--start-stage", type=int, default=0, help="Stage index represented by the input sketch")
     parser.add_argument(
@@ -154,6 +161,39 @@ def parse_args() -> argparse.Namespace:
         help="Extra weight on similarity to the current source embedding during early-stage reranking",
     )
     return parser.parse_args()
+
+
+def resolve_embedding_backend(requested_backend: str, model_config: Dict[str, object], embeddings_path: Path) -> str:
+    if requested_backend != "auto":
+        return requested_backend
+
+    training_config = model_config.get("training_config", {})
+    if isinstance(training_config, dict):
+        saved_backend = str(training_config.get("embedding_backend", "")).strip().lower()
+        if saved_backend in {"clip", "dino"}:
+            return saved_backend
+
+    name = embeddings_path.name.lower()
+    if "dino" in name:
+        return "dino"
+    if "clip" in name:
+        return "clip"
+    return "clip"
+
+
+def resolve_model_id(requested_model_id: str, embedding_backend: str, model_config: Dict[str, object]) -> str:
+    if str(requested_model_id).strip():
+        return str(requested_model_id).strip()
+
+    training_config = model_config.get("training_config", {})
+    if isinstance(training_config, dict):
+        saved_model_id = str(training_config.get("model_id", "")).strip()
+        if saved_model_id:
+            return saved_model_id
+
+    if embedding_backend == "dino":
+        return "facebook/dinov2-base"
+    return "openai/clip-vit-base-patch32"
 
 
 def load_frame_bank(npz_path: Path, manifest_path: Path, retrieval_split: str) -> Dict[int, Dict[str, object]]:
@@ -668,8 +708,11 @@ def main() -> None:
 
     model_config = load_model_config(Path(args.metrics_json))
     checkpoint = Path(args.checkpoint)
+    embeddings_path = Path(args.embeddings_npz)
+    embedding_backend = resolve_embedding_backend(args.embedding_backend, model_config, embeddings_path)
+    model_id = resolve_model_id(args.model_id, embedding_backend, model_config)
 
-    stage_bank = load_frame_bank(Path(args.embeddings_npz), Path(args.manifest_frames), args.retrieval_split)
+    stage_bank = load_frame_bank(embeddings_path, Path(args.manifest_frames), args.retrieval_split)
     stage_chain = build_stage_chain(args.start_stage, args.end_stage, int(model_config["num_stages"]), stage_bank)
 
     embedding_dim = int(np.asarray(next(iter(stage_bank.values()))["embeddings"]).shape[1])
@@ -684,7 +727,10 @@ def main() -> None:
     load_transition_mlp_checkpoint(model, checkpoint, device)
     model.eval()
 
-    current_embedding = embed_image_with_clip(input_image, args.model_id, device)
+    if embedding_backend == "dino":
+        current_embedding = embed_image_with_dino(input_image, model_id, device)
+    else:
+        current_embedding = embed_image_with_clip(input_image, model_id, device)
     anchor_embedding = np.asarray(current_embedding, dtype=np.float32).copy()
     structural_threshold = 0.5
 
@@ -760,7 +806,8 @@ def main() -> None:
     summary = {
         "input_image": str(input_image),
         "checkpoint": str(checkpoint),
-        "model_id": args.model_id,
+        "embedding_backend": embedding_backend,
+        "model_id": model_id,
         "device": str(device),
         "render_mode": args.render_mode,
         "start_stage": args.start_stage,

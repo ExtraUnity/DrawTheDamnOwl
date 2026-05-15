@@ -71,6 +71,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--blend-cosine-weight", type=float, default=0.3, help="Cosine weight in blended checkpoint selection")
     parser.add_argument("--patience", type=int, default=25, help="Early stopping patience on the selected validation metric")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--embedding-backend",
+        choices=["auto", "clip", "dino"],
+        default="auto",
+        help="Encoder family used to produce the embedding archive.",
+    )
     return parser.parse_args()
 
 
@@ -79,6 +85,18 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def resolve_embedding_backend(requested_backend: str, embeddings_path: Path) -> str:
+    if requested_backend != "auto":
+        return requested_backend
+
+    name = embeddings_path.name.lower()
+    if "dino" in name:
+        return "dino"
+    if "clip" in name:
+        return "clip"
+    return "clip"
 
 
 def load_embedding_lookup(path: Path) -> Tuple[Dict[Tuple[str, int], np.ndarray], int]:
@@ -390,6 +408,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     ensure_dir(output_dir)
     device = torch.device(args.device)
+    embedding_backend = resolve_embedding_backend(args.embedding_backend, Path(args.embeddings_npz))
 
     lookup, embedding_dim = load_embedding_lookup(Path(args.embeddings_npz))
     rows = load_transitions(Path(args.transitions_csv), lookup)
@@ -484,6 +503,7 @@ def main() -> None:
             "num_stages": max_stage_idx + 1,
         },
         "training_config": {
+            "embedding_backend": embedding_backend,
             "horizontal_flip_augmentation": bool(args.horizontal_flip_augmentation),
             "model_id": args.model_id,
             "flip_aug_batch_size": args.flip_aug_batch_size,
