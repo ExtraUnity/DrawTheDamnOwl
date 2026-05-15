@@ -53,17 +53,29 @@ def parse_args() -> argparse.Namespace:
         default=str(LEARNING_ROOT / "manifest_transitions.csv"),
         help="CSV with source/target image pairs.",
     )
-    parser.add_argument("--image_size", type=int, default=128, help="Square input resolution. Must be divisible by 8.")
+    parser.add_argument("--image_size", type=int, default=128, help="Square input resolution. Must be divisible by 2**num_downsamples.")
     parser.add_argument("--channels", type=int, choices=[1, 3], default=3, help="Load images as grayscale or RGB.")
+    parser.add_argument(
+        "--num_downsamples",
+        type=int,
+        default=0,
+        help="Autoencoder downsample stages. Set <= 0 to choose a depth that keeps the latent map near 16x16.",
+    )
     parser.add_argument("--latent_channels", type=int, default=64, help="Number of channels in the spatial latent map.")
     parser.add_argument("--base_channels", type=int, default=32, help="Base width for the convolutional autoencoder.")
     parser.add_argument("--transition_hidden_channels", type=int, default=64, help="Hidden width for the latent transition CNN.")
     parser.add_argument("--transition_blocks", type=int, default=4, help="Number of residual blocks in the latent transition CNN.")
+    parser.add_argument("--stage_embed_dim", type=int, default=16, help="Embedding width for source-stage conditioning.")
     parser.add_argument(
         "--transition_residual",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Predict the next latent as z1 + f(z1) instead of predicting z2 directly.",
+    )
+    parser.add_argument(
+        "--disable_stage_conditioning",
+        action="store_true",
+        help="Disable explicit source-stage conditioning in the latent transition model.",
     )
     parser.add_argument("--batch_size", type=int, default=16, help="Mini-batch size.")
     parser.add_argument("--epochs_autoencoder", type=int, default=100, help="Number of autoencoder epochs.")
@@ -122,6 +134,16 @@ def set_seed(seed: int) -> None:
     if hasattr(torch.backends, "cudnn"):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+
+
+def resolve_num_downsamples(image_size: int, requested_num_downsamples: int) -> int:
+    if requested_num_downsamples > 0:
+        return int(requested_num_downsamples)
+
+    num_downsamples = 3
+    while image_size % (2 ** (num_downsamples + 1)) == 0 and (image_size // (2**num_downsamples)) > 16:
+        num_downsamples += 1
+    return num_downsamples
 
 
 def validate_fractions(train_fraction: float, val_fraction: float, test_fraction: float) -> None:
@@ -652,10 +674,11 @@ def forward_pair_models(
     transition: SpatialLatentTransition,
     source: torch.Tensor,
     target: torch.Tensor,
+    source_stage: torch.Tensor | None = None,
 ) -> Dict[str, torch.Tensor]:
     z1 = autoencoder.encode(source)
     z2 = autoencoder.encode(target)
-    z2_pred = transition(z1)
+    z2_pred = transition(z1, source_stage)
     source_decode = autoencoder.decode(z1)
     target_recon = autoencoder.decode(z2)
     transition_pred = autoencoder.decode(z2_pred)
@@ -745,7 +768,8 @@ def save_transition_samples(
             sample = dataset[row_idx]
             source = sample["source"].unsqueeze(0).to(device)
             target = sample["target"].unsqueeze(0).to(device)
-            outputs = forward_pair_models(autoencoder, transition, source, target)
+            source_stage = torch.tensor([int(sample["source_stage"])], dtype=torch.long, device=device)
+            outputs = forward_pair_models(autoencoder, transition, source, target, source_stage)
             images = [
                 sample["source"],
                 sample["target"],
@@ -831,14 +855,15 @@ def train_transition_epoch(
     for batch in maybe_tqdm(loader, desc=f"tr train {epoch:03d}"):
         source = batch["source"].to(device)
         target = batch["target"].to(device)
+        source_stage = batch["source_stage"].to(device)
 
         if args.finetune_autoencoder_during_transition:
-            outputs = forward_pair_models(autoencoder, transition, source, target)
+            outputs = forward_pair_models(autoencoder, transition, source, target, source_stage)
         else:
             with torch.no_grad():
                 z1 = autoencoder.encode(source)
                 z2 = autoencoder.encode(target)
-            z2_pred = transition(z1)
+            z2_pred = transition(z1, source_stage)
             target_pred = autoencoder.decode(z2_pred)
             outputs = {"z1": z1, "z2": z2, "z2_pred": z2_pred, "transition_pred": target_pred}
 
@@ -872,12 +897,13 @@ def train_decoder_finetune_epoch(
     for batch in maybe_tqdm(loader, desc=f"ft train {epoch:03d}"):
         source = batch["source"].to(device)
         target = batch["target"].to(device)
+        source_stage = batch["source_stage"].to(device)
 
         with torch.no_grad():
             z1 = autoencoder.encode(source)
             z2 = autoencoder.encode(target)
 
-        z2_pred = transition(z1)
+        z2_pred = transition(z1, source_stage)
         target_pred = autoencoder.decode(z2_pred)
         terms = compute_image_terms(target_pred, target, args.foreground_threshold, args.foreground_dilate)
         latent_loss = F.mse_loss(z2_pred, z2)
@@ -911,7 +937,8 @@ def evaluate_pair_models(
         for batch in maybe_tqdm(loader, desc="pair eval"):
             source = batch["source"].to(device)
             target = batch["target"].to(device)
-            outputs = forward_pair_models(autoencoder, transition, source, target)
+            source_stage = batch["source_stage"].to(device)
+            outputs = forward_pair_models(autoencoder, transition, source, target, source_stage)
 
             target_terms = compute_image_terms(outputs["target_recon"], target, args.foreground_threshold, args.foreground_dilate)
             source_terms = compute_image_terms(outputs["source_decode"], target, args.foreground_threshold, args.foreground_dilate)
@@ -1005,8 +1032,10 @@ def save_split_sample_sheets(
 def main() -> None:
     args = parse_args()
     validate_fractions(args.train_fraction, args.val_fraction, args.test_fraction)
-    if args.image_size % 8 != 0:
-        raise ValueError("--image_size must be divisible by 8 for the default 3-level autoencoder.")
+    args.num_downsamples = resolve_num_downsamples(args.image_size, int(args.num_downsamples))
+    downsample_factor = 2 ** int(args.num_downsamples)
+    if args.image_size % downsample_factor != 0:
+        raise ValueError(f"--image_size must be divisible by {downsample_factor} for num_downsamples={args.num_downsamples}.")
 
     set_seed(args.seed)
     data_dir = Path(args.data_dir)
@@ -1038,6 +1067,9 @@ def main() -> None:
     )
     pair_splits = split_rows(rows)
     image_splits = build_unique_image_rows(pair_splits)
+    source_stages = [int(row["source_stage"]) for row in rows if row["source_stage"] is not None]
+    use_stage_conditioning = (len(source_stages) == len(rows)) and not bool(args.disable_stage_conditioning)
+    num_stages = (max(source_stages) + 1) if use_stage_conditioning else None
 
     image_datasets = {
         "train": UniqueImageDataset(image_splits["train"], args.image_size, args.channels, augment_config, training=True),
@@ -1082,6 +1114,12 @@ def main() -> None:
     }
 
     print_split_summary(pair_splits, image_splits)
+    latent_resolution = args.image_size // downsample_factor
+    print(
+        f"model setup: num_downsamples={args.num_downsamples} "
+        f"latent_resolution={latent_resolution}x{latent_resolution} "
+        f"stage_conditioning={'on' if use_stage_conditioning else 'off'}"
+    )
 
     config = {
         "data_dir": str(data_dir),
@@ -1096,13 +1134,15 @@ def main() -> None:
         in_channels=args.channels,
         base_channels=args.base_channels,
         latent_channels=args.latent_channels,
-        num_downsamples=3,
+        num_downsamples=args.num_downsamples,
     ).to(device)
     transition = SpatialLatentTransition(
         latent_channels=args.latent_channels,
         hidden_channels=args.transition_hidden_channels,
         num_blocks=args.transition_blocks,
         residual=args.transition_residual,
+        num_stages=num_stages,
+        stage_embed_dim=args.stage_embed_dim,
     ).to(device)
 
     autoencoder_optimizer = torch.optim.AdamW(autoencoder.parameters(), lr=args.lr, weight_decay=args.weight_decay)
