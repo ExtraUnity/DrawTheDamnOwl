@@ -83,9 +83,14 @@ def parse_args() -> argparse.Namespace:
         help="Disable explicit source-stage conditioning in the latent transition model.",
     )
     parser.add_argument(
+        "--enable_decoder_stage_conditioning",
+        action="store_true",
+        help="Enable target-stage conditioning in the decoder. Off by default because it can hurt autoencoder reconstruction.",
+    )
+    parser.add_argument(
         "--disable_decoder_stage_conditioning",
         action="store_true",
-        help="Disable target-stage conditioning in the decoder while keeping the encoder unconditional.",
+        help="Legacy no-op when decoder stage conditioning is not enabled; kept for CLI compatibility.",
     )
     parser.add_argument("--batch_size", type=int, default=16, help="Mini-batch size.")
     parser.add_argument("--epochs_autoencoder", type=int, default=100, help="Number of autoencoder epochs.")
@@ -1104,7 +1109,11 @@ def main() -> None:
     all_stage_values = source_stages + target_stages
     has_all_stage_annotations = len(source_stages) == len(rows) and len(target_stages) == len(rows)
     use_transition_stage_conditioning = (len(source_stages) == len(rows)) and not bool(args.disable_stage_conditioning)
-    use_decoder_stage_conditioning = has_all_stage_annotations and not bool(args.disable_decoder_stage_conditioning)
+    use_decoder_stage_conditioning = (
+        has_all_stage_annotations
+        and bool(args.enable_decoder_stage_conditioning)
+        and not bool(args.disable_decoder_stage_conditioning)
+    )
     num_stages = (max(all_stage_values) + 1) if all_stage_values else None
 
     image_datasets = {
