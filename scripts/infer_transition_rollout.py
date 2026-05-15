@@ -14,12 +14,15 @@ from learning_utils import (
     TransitionSequenceTransformer,
     PixelDecoderUNet,
     StructuralLayerUNet,
+    combine_stage_features,
     compose_white_layer,
     default_device,
     embed_image_with_clip,
     embed_image_with_dino,
+    extract_clip_image_features,
     image_to_tensor,
     load_checkpoint_state,
+    load_clip,
     load_embedding_archive,
     load_model_config,
     load_transition_mlp_checkpoint,
@@ -288,6 +291,60 @@ def transform_stage_bank(
         transformed_bucket["embeddings"] = embedding_transform(np.asarray(bucket["embeddings"], dtype=np.float32)).astype(np.float32)
         out[int(stage)] = transformed_bucket
     return out
+
+
+def build_frame_manifest_by_image_path(manifest_path: Path) -> Dict[str, Dict[str, str]]:
+    lookup: Dict[str, Dict[str, str]] = {}
+    for row in read_csv_rows(manifest_path, description="Frame manifest"):
+        image_path = str(Path(row["image_path"]).resolve())
+        lookup[image_path] = row
+    return lookup
+
+
+def embed_image_with_clip_for_archive(
+    image_path: Path,
+    model_id: str,
+    device: torch.device,
+    target_dim: int,
+    frame_manifest_by_path: Dict[str, Dict[str, str]],
+) -> np.ndarray:
+    image_embedding = embed_image_with_clip(image_path, model_id, device)
+    if int(target_dim) == int(image_embedding.shape[0]):
+        return image_embedding
+
+    image_path_resolved = str(image_path.resolve())
+    manifest_row = frame_manifest_by_path.get(image_path_resolved)
+    layer_path_raw = str(manifest_row.get("layer_path", "")).strip() if manifest_row is not None else ""
+
+    processor, clip_model = load_clip(model_id, device)
+    with Image.open(image_path) as image:
+        rgb_image = image.convert("RGB")
+    inputs = processor(images=[rgb_image], return_tensors="pt")
+    inputs = {key: value.to(device) for key, value in inputs.items()}
+    with torch.no_grad():
+        image_feature = extract_clip_image_features(clip_model, inputs)
+        image_feature = torch.nn.functional.normalize(image_feature, p=2, dim=-1)[0].detach().cpu().numpy().astype(np.float32)
+
+    if layer_path_raw:
+        layer_path = Path(layer_path_raw)
+        require_file(layer_path, "Layer image")
+        with Image.open(layer_path) as layer_image:
+            rgb_layer = layer_image.convert("RGB")
+        layer_inputs = processor(images=[rgb_layer], return_tensors="pt")
+        layer_inputs = {key: value.to(device) for key, value in layer_inputs.items()}
+        with torch.no_grad():
+            layer_feature = extract_clip_image_features(clip_model, layer_inputs)
+            layer_feature = torch.nn.functional.normalize(layer_feature, p=2, dim=-1)[0].detach().cpu().numpy().astype(np.float32)
+        combined = combine_stage_features(image_feature, layer_feature)
+    else:
+        combined = combine_stage_features(image_feature, image_feature)
+
+    if int(combined.shape[0]) != int(target_dim):
+        raise RuntimeError(
+            "CLIP input embedding dimension does not match the retrieval archive. "
+            f"Expected {target_dim}, got {combined.shape[0]}."
+        )
+    return combined.astype(np.float32)
 
 
 def load_transition_sequence_checkpoint(model: torch.nn.Module, checkpoint_path: Path, device: torch.device) -> None:
@@ -886,6 +943,7 @@ def main() -> None:
         load_frame_bank(embeddings_path, Path(args.manifest_frames), args.retrieval_split),
         embedding_transform,
     )
+    frame_manifest_by_path = build_frame_manifest_by_image_path(Path(args.manifest_frames))
     stage_chain = build_stage_chain(args.start_stage, args.end_stage, int(model_config["num_stages"]), stage_bank)
 
     embedding_dim = int(np.asarray(next(iter(stage_bank.values()))["embeddings"]).shape[1])
@@ -935,7 +993,13 @@ def main() -> None:
     if embedding_backend == "dino":
         current_embedding = embed_image_with_dino(input_image, model_id, device)
     else:
-        current_embedding = embed_image_with_clip(input_image, model_id, device)
+        current_embedding = embed_image_with_clip_for_archive(
+            image_path=input_image,
+            model_id=model_id,
+            device=device,
+            target_dim=embedding_dim,
+            frame_manifest_by_path=frame_manifest_by_path,
+        )
     current_embedding = embedding_transform(np.asarray(current_embedding, dtype=np.float32)).astype(np.float32)
     anchor_embedding = np.asarray(current_embedding, dtype=np.float32).copy()
     structural_threshold = 0.5
