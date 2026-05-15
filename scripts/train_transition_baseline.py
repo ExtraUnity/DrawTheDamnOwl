@@ -72,6 +72,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=25, help="Early stopping patience on the selected validation metric")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
+        "--disable_stage_conditioning",
+        action="store_true",
+        help="Train the MLP without source-stage embeddings.",
+    )
+    parser.add_argument(
         "--embedding-backend",
         choices=["auto", "clip", "dino"],
         default="auto",
@@ -443,6 +448,7 @@ def main() -> None:
         stage_embed_dim=args.stage_embed_dim,
         dropout=args.dropout,
         num_stages=max_stage_idx + 1,
+        use_stage_conditioning=not args.disable_stage_conditioning,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -501,9 +507,11 @@ def main() -> None:
             "stage_embed_dim": args.stage_embed_dim,
             "dropout": args.dropout,
             "num_stages": max_stage_idx + 1,
+            "use_stage_conditioning": not args.disable_stage_conditioning,
         },
         "training_config": {
             "embedding_backend": embedding_backend,
+            "disable_stage_conditioning": bool(args.disable_stage_conditioning),
             "horizontal_flip_augmentation": bool(args.horizontal_flip_augmentation),
             "model_id": args.model_id,
             "flip_aug_batch_size": args.flip_aug_batch_size,

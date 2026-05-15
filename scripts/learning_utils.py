@@ -210,11 +210,21 @@ def combine_stage_features(image_features: np.ndarray, layer_features: Optional[
 
 
 class TransitionMLP(nn.Module):
-    def __init__(self, embedding_dim: int, hidden_dim: int, stage_embed_dim: int, dropout: float, num_stages: int):
+    def __init__(
+        self,
+        embedding_dim: int,
+        hidden_dim: int,
+        stage_embed_dim: int,
+        dropout: float,
+        num_stages: int,
+        use_stage_conditioning: bool = True,
+    ):
         super().__init__()
-        self.stage_embed = nn.Embedding(num_stages, stage_embed_dim)
+        self.use_stage_conditioning = bool(use_stage_conditioning)
+        self.stage_embed = nn.Embedding(num_stages, stage_embed_dim) if self.use_stage_conditioning else None
+        input_dim = embedding_dim + (stage_embed_dim if self.use_stage_conditioning else 0)
         self.net = nn.Sequential(
-            nn.Linear(embedding_dim + stage_embed_dim, hidden_dim),
+            nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
@@ -224,8 +234,13 @@ class TransitionMLP(nn.Module):
         )
 
     def forward(self, src_embedding: torch.Tensor, src_stage_idx: torch.Tensor) -> torch.Tensor:
-        stage_vec = self.stage_embed(src_stage_idx)
-        pred_delta = self.net(torch.cat([src_embedding, stage_vec], dim=-1))
+        if self.use_stage_conditioning:
+            assert self.stage_embed is not None
+            stage_vec = self.stage_embed(src_stage_idx)
+            model_input = torch.cat([src_embedding, stage_vec], dim=-1)
+        else:
+            model_input = src_embedding
+        pred_delta = self.net(model_input)
         pred = src_embedding + pred_delta
         return torch.nn.functional.normalize(pred, p=2, dim=-1)
 
@@ -243,6 +258,7 @@ class TransitionSequenceTransformer(nn.Module):
         max_seq_len: int,
         stage_embed_dim: int,
         stage_specific_output_heads: bool = True,
+        use_stage_conditioning: bool = True,
     ):
         super().__init__()
         if max_seq_len <= 0:
@@ -251,10 +267,11 @@ class TransitionSequenceTransformer(nn.Module):
         self.max_seq_len = int(max_seq_len)
         self.num_stages = int(num_stages)
         self.stage_specific_output_heads = bool(stage_specific_output_heads)
+        self.use_stage_conditioning = bool(use_stage_conditioning)
         self.feature_norm = nn.LayerNorm(embedding_dim)
         self.input_proj = nn.Linear(embedding_dim, model_dim)
-        self.stage_embed = nn.Embedding(num_stages, stage_embed_dim)
-        self.stage_proj = nn.Linear(stage_embed_dim, model_dim)
+        self.stage_embed = nn.Embedding(num_stages, stage_embed_dim) if self.use_stage_conditioning else None
+        self.stage_proj = nn.Linear(stage_embed_dim, model_dim) if self.use_stage_conditioning else None
         self.pos_embed = nn.Embedding(max_seq_len, model_dim)
         self.input_norm = nn.LayerNorm(model_dim)
         self.input_dropout = nn.Dropout(dropout)
@@ -311,7 +328,10 @@ class TransitionSequenceTransformer(nn.Module):
         positions = torch.arange(src_embeddings.shape[1], device=src_embeddings.device).unsqueeze(0)
         src_embeddings_norm = self.feature_norm(src_embeddings)
         hidden = self.input_proj(src_embeddings_norm)
-        hidden = hidden + self.stage_proj(self.stage_embed(src_stage_idx)) + self.pos_embed(positions)
+        hidden = hidden + self.pos_embed(positions)
+        if self.use_stage_conditioning:
+            assert self.stage_embed is not None and self.stage_proj is not None
+            hidden = hidden + self.stage_proj(self.stage_embed(src_stage_idx))
         hidden = self.input_dropout(self.input_norm(hidden))
         hidden = self.encoder(hidden, src_key_padding_mask=src_padding_mask)
 
@@ -360,6 +380,7 @@ class TransitionSequenceCNN(nn.Module):
         max_seq_len: int,
         stage_embed_dim: int,
         stage_specific_output_heads: bool = True,
+        use_stage_conditioning: bool = True,
     ):
         super().__init__()
         if max_seq_len <= 0:
@@ -372,10 +393,11 @@ class TransitionSequenceCNN(nn.Module):
         self.max_seq_len = int(max_seq_len)
         self.num_stages = int(num_stages)
         self.stage_specific_output_heads = bool(stage_specific_output_heads)
+        self.use_stage_conditioning = bool(use_stage_conditioning)
         self.feature_norm = nn.LayerNorm(embedding_dim)
         self.input_proj = nn.Linear(embedding_dim, model_dim)
-        self.stage_embed = nn.Embedding(num_stages, stage_embed_dim)
-        self.stage_proj = nn.Linear(stage_embed_dim, model_dim)
+        self.stage_embed = nn.Embedding(num_stages, stage_embed_dim) if self.use_stage_conditioning else None
+        self.stage_proj = nn.Linear(stage_embed_dim, model_dim) if self.use_stage_conditioning else None
         self.pos_embed = nn.Embedding(max_seq_len, model_dim)
         self.input_norm = nn.LayerNorm(model_dim)
         self.input_dropout = nn.Dropout(dropout)
@@ -428,7 +450,10 @@ class TransitionSequenceCNN(nn.Module):
         positions = torch.arange(src_embeddings.shape[1], device=src_embeddings.device).unsqueeze(0)
         src_embeddings_norm = self.feature_norm(src_embeddings)
         hidden = self.input_proj(src_embeddings_norm)
-        hidden = hidden + self.stage_proj(self.stage_embed(src_stage_idx)) + self.pos_embed(positions)
+        hidden = hidden + self.pos_embed(positions)
+        if self.use_stage_conditioning:
+            assert self.stage_embed is not None and self.stage_proj is not None
+            hidden = hidden + self.stage_proj(self.stage_embed(src_stage_idx))
         hidden = self.input_dropout(self.input_norm(hidden))
 
         valid_mask = (~src_padding_mask).unsqueeze(-1).to(dtype=hidden.dtype)

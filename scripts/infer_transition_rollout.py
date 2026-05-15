@@ -1,7 +1,8 @@
+import json
 import argparse
 import shutil
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -9,6 +10,8 @@ from PIL import Image, ImageDraw, ImageOps
 
 from learning_utils import (
     TransitionMLP,
+    TransitionSequenceCNN,
+    TransitionSequenceTransformer,
     PixelDecoderUNet,
     StructuralLayerUNet,
     compose_white_layer,
@@ -16,9 +19,11 @@ from learning_utils import (
     embed_image_with_clip,
     embed_image_with_dino,
     image_to_tensor,
+    load_checkpoint_state,
     load_embedding_archive,
     load_model_config,
     load_transition_mlp_checkpoint,
+    normalize_rows,
     tensor_to_pil,
 )
 from script_utils import LEARNING_ROOT, ensure_dir, read_csv_rows, require_file, write_json
@@ -95,6 +100,12 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "clip", "dino"],
         default="auto",
         help="Encoder family used to create the embedding archive and encode the input sketch.",
+    )
+    parser.add_argument(
+        "--transition-model",
+        choices=["auto", "mlp", "transformer", "cnn"],
+        default="auto",
+        help="Transition model family to load from the checkpoint.",
     )
     parser.add_argument("--model-id", default="", help="Encoder model id. Leave empty to infer from metrics or backend defaults.")
     parser.add_argument("--device", default=default_device(), help="Inference device")
@@ -194,6 +205,132 @@ def resolve_model_id(requested_model_id: str, embedding_backend: str, model_conf
     if embedding_backend == "dino":
         return "facebook/dinov2-base"
     return "openai/clip-vit-base-patch32"
+
+
+def load_metrics_summary(metrics_path: Path) -> Dict[str, Any]:
+    require_file(metrics_path, "Metrics JSON")
+    with metrics_path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def resolve_transition_model_family(requested_model: str, model_config: Dict[str, Any]) -> str:
+    if requested_model != "auto":
+        return requested_model
+
+    explicit = str(model_config.get("sequence_model", "")).strip().lower()
+    if explicit in {"mlp", "transformer", "cnn"}:
+        return explicit
+    if "num_heads" in model_config and "ff_dim" in model_config:
+        return "transformer"
+    if "cnn_kernel_size" in model_config or "cnn_dilation_cycle" in model_config:
+        return "cnn"
+    return "mlp"
+
+
+def load_embedding_transform(metrics_summary: Dict[str, Any], metrics_path: Path) -> Tuple[str, Callable[[np.ndarray], np.ndarray]]:
+    training_config = metrics_summary.get("training_config", {})
+    feature_stats = metrics_summary.get("feature_stats", {})
+    feature_transform = str(training_config.get("feature_transform", "none")).strip().lower()
+    if feature_transform in {"", "none", "auto"}:
+        return "none", lambda x: np.asarray(x, dtype=np.float32)
+
+    transform_path_raw = ""
+    if isinstance(feature_stats, dict):
+        transform_path_raw = str(feature_stats.get("transform_path", "")).strip()
+    transform_path = Path(transform_path_raw) if transform_path_raw else (metrics_path.parent / "feature_transform.npz")
+    require_file(transform_path, "Feature transform")
+
+    with np.load(transform_path, allow_pickle=True) as archive:
+        data = {name: archive[name] for name in archive.files}
+
+    if feature_transform == "standardize":
+        mean = np.asarray(data["mean"], dtype=np.float32)
+        std = np.asarray(data["std"], dtype=np.float32)
+
+        def transform(x: np.ndarray) -> np.ndarray:
+            arr = np.asarray(x, dtype=np.float32)
+            if arr.ndim == 1:
+                return normalize_rows(((arr[None, :] - mean[None, :]) / std[None, :]).astype(np.float32))[0]
+            return normalize_rows(((arr - mean[None, :]) / std[None, :]).astype(np.float32))
+
+        return feature_transform, transform
+
+    if feature_transform in {"pca", "pca_whiten"}:
+        mean = np.asarray(data["mean"], dtype=np.float32)
+        components = np.asarray(data["components"], dtype=np.float32)
+        scales = np.asarray(data["scales"], dtype=np.float32)
+
+        def project(x: np.ndarray) -> np.ndarray:
+            centered = x - mean
+            projected = centered @ components
+            projected = projected / scales
+            return projected.astype(np.float32)
+
+        def transform(x: np.ndarray) -> np.ndarray:
+            arr = np.asarray(x, dtype=np.float32)
+            if arr.ndim == 1:
+                return normalize_rows(project(arr)[None, :])[0]
+            projected = np.stack([project(row) for row in arr], axis=0)
+            return normalize_rows(projected)
+
+        return feature_transform, transform
+
+    raise ValueError(f"Unsupported feature transform for inference: {feature_transform}")
+
+
+def transform_stage_bank(
+    stage_bank: Dict[int, Dict[str, object]],
+    embedding_transform: Callable[[np.ndarray], np.ndarray],
+) -> Dict[int, Dict[str, object]]:
+    out: Dict[int, Dict[str, object]] = {}
+    for stage, bucket in stage_bank.items():
+        transformed_bucket = dict(bucket)
+        transformed_bucket["embeddings"] = embedding_transform(np.asarray(bucket["embeddings"], dtype=np.float32)).astype(np.float32)
+        out[int(stage)] = transformed_bucket
+    return out
+
+
+def load_transition_sequence_checkpoint(model: torch.nn.Module, checkpoint_path: Path, device: torch.device) -> None:
+    state = load_checkpoint_state(checkpoint_path, device)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            "Error loading transition sequence checkpoint. "
+            f"Missing keys: {list(missing)}. Unexpected keys: {list(unexpected)}."
+        )
+
+
+def predict_next_embedding(
+    model_family: str,
+    model: torch.nn.Module,
+    sequence_embeddings: List[np.ndarray],
+    sequence_stages: List[int],
+    device: torch.device,
+    max_seq_len: int,
+) -> np.ndarray:
+    if not sequence_embeddings or not sequence_stages:
+        raise RuntimeError("Rollout sequence state is empty.")
+    if len(sequence_embeddings) != len(sequence_stages):
+        raise RuntimeError("Rollout sequence embeddings/stages length mismatch.")
+
+    if model_family == "mlp":
+        source_embedding = np.asarray(sequence_embeddings[-1], dtype=np.float32)
+        src_tensor = torch.from_numpy(source_embedding).unsqueeze(0).to(device)
+        src_stage_tensor = torch.tensor([sequence_stages[-1]], dtype=torch.long, device=device)
+        with torch.no_grad():
+            pred = model(src_tensor, src_stage_tensor)[0].detach().cpu().numpy().astype(np.float32)
+        pred /= max(float(np.linalg.norm(pred)), 1e-12)
+        return pred
+
+    seq_embeddings = sequence_embeddings[-max_seq_len:] if max_seq_len > 0 else sequence_embeddings
+    seq_stages = sequence_stages[-max_seq_len:] if max_seq_len > 0 else sequence_stages
+    src_embeddings = torch.from_numpy(np.stack(seq_embeddings, axis=0).astype(np.float32)).unsqueeze(0).to(device)
+    src_stage_indices = torch.tensor([seq_stages], dtype=torch.long, device=device)
+    src_padding_mask = torch.zeros((1, len(seq_stages)), dtype=torch.bool, device=device)
+    with torch.no_grad():
+        pred = model(src_embeddings, src_stage_indices, src_padding_mask)[0].detach().cpu().numpy().astype(np.float32)
+    pred /= max(float(np.linalg.norm(pred)), 1e-12)
+    return pred
 
 
 def load_frame_bank(npz_path: Path, manifest_path: Path, retrieval_split: str) -> Dict[int, Dict[str, object]]:
@@ -393,13 +530,15 @@ def build_stage_chain(start_stage: int, end_stage: int, num_stages: int, stage_b
 
 
 def rollout_stages(
-    model: TransitionMLP,
+    model_family: str,
+    model: torch.nn.Module,
     current_embedding: np.ndarray,
     anchor_embedding: np.ndarray,
     stage_bank: Dict[int, Dict[str, object]],
     stage_chain: List[int],
     output_dir: Path,
     device: torch.device,
+    max_seq_len: int,
     use_retrieved_embedding: bool,
     retrieval_topk: int,
     retrieval_beam_width: int,
@@ -415,6 +554,8 @@ def rollout_stages(
     beam: List[Dict[str, object]] = [
         {
             "model_embedding": np.asarray(current_embedding, dtype=np.float32),
+            "sequence_embeddings": [np.asarray(current_embedding, dtype=np.float32)],
+            "sequence_stages": [int(stage_chain[0])],
             "prev_retrieved_embedding": None,
             "score": 0.0,
             "steps": [],
@@ -441,13 +582,14 @@ def rollout_stages(
 
         for state in beam:
             source_embedding = np.asarray(state["model_embedding"], dtype=np.float32)
-            src_tensor = torch.from_numpy(source_embedding).unsqueeze(0).to(device)
-            src_stage_tensor = torch.tensor([src_stage], dtype=torch.long, device=device)
-
-            with torch.no_grad():
-                pred = model(src_tensor, src_stage_tensor)[0].detach().cpu().numpy().astype(np.float32)
-
-            pred /= max(float(np.linalg.norm(pred)), 1e-12)
+            pred = predict_next_embedding(
+                model_family=model_family,
+                model=model,
+                sequence_embeddings=list(state["sequence_embeddings"]),
+                sequence_stages=list(state["sequence_stages"]),
+                device=device,
+                max_seq_len=max_seq_len,
+            )
             candidates = retrieve_topk(pred, stage_bank[predicted_stage], stage_topk)
             if not candidates:
                 raise RuntimeError(f"No retrieval candidates available for stage {predicted_stage}")
@@ -469,6 +611,11 @@ def rollout_stages(
 
             for candidate in scored[:beam_width]:
                 next_embedding = np.asarray(candidate["embedding"] if use_retrieved_embedding else pred, dtype=np.float32)
+                next_sequence_embeddings = [*state["sequence_embeddings"], next_embedding]
+                next_sequence_stages = [*state["sequence_stages"], int(predicted_stage)]
+                if max_seq_len > 0 and len(next_sequence_embeddings) > max_seq_len:
+                    next_sequence_embeddings = next_sequence_embeddings[-max_seq_len:]
+                    next_sequence_stages = next_sequence_stages[-max_seq_len:]
                 step = {
                     "source_stage": src_stage,
                     "predicted_stage": predicted_stage,
@@ -491,6 +638,8 @@ def rollout_stages(
                 next_beam.append(
                     {
                         "model_embedding": next_embedding,
+                        "sequence_embeddings": next_sequence_embeddings,
+                        "sequence_stages": next_sequence_stages,
                         "prev_retrieved_embedding": np.asarray(candidate["embedding"], dtype=np.float32),
                         "score": float(state["score"]) + float(candidate["rerank_score"]),
                         "steps": [*state["steps"], step],
@@ -561,7 +710,8 @@ def load_structural_decoder(checkpoint_path: Path, device: torch.device) -> Tupl
 
 
 def rollout_stages_with_pixel_decoder(
-    model: TransitionMLP,
+    model_family: str,
+    model: torch.nn.Module,
     pixel_decoder: PixelDecoderUNet,
     structural_decoder: StructuralLayerUNet | None,
     current_embedding: np.ndarray,
@@ -573,6 +723,7 @@ def rollout_stages_with_pixel_decoder(
     output_dir: Path,
     device: torch.device,
     image_size: int,
+    max_seq_len: int,
     save_retrieval_fallback: bool,
     use_retrieved_embedding: bool,
     structural_until_stage: int,
@@ -588,19 +739,26 @@ def rollout_stages_with_pixel_decoder(
 ) -> List[Dict[str, object]]:
     rollout: List[Dict[str, object]] = []
     prev_retrieved_embedding: np.ndarray | None = None
+    sequence_embeddings: List[np.ndarray] = [np.asarray(current_embedding, dtype=np.float32)]
+    sequence_stages: List[int] = [int(start_stage)]
 
     with Image.open(input_image) as image:
         current_image = image_to_tensor(image, image_size).to(device)
 
     for src_stage in range(start_stage, end_stage):
-        src_tensor = torch.from_numpy(current_embedding).unsqueeze(0).to(device)
         src_stage_tensor = torch.tensor([src_stage], dtype=torch.long, device=device)
         predicted_stage = src_stage + 1
 
+        pred_np = predict_next_embedding(
+            model_family=model_family,
+            model=model,
+            sequence_embeddings=sequence_embeddings,
+            sequence_stages=sequence_stages,
+            device=device,
+            max_seq_len=max_seq_len,
+        )
+        pred = torch.from_numpy(pred_np).unsqueeze(0).to(device)
         with torch.no_grad():
-            pred = model(src_tensor, src_stage_tensor)
-            pred_np = pred[0].detach().cpu().numpy().astype(np.float32)
-            pred_np /= max(float(np.linalg.norm(pred_np)), 1e-12)
             if structural_decoder is not None and predicted_stage <= structural_until_stage:
                 layer_probs = torch.sigmoid(structural_decoder(current_image.unsqueeze(0), src_stage_tensor))
                 layer = (layer_probs >= structural_threshold).to(dtype=torch.float32)
@@ -693,6 +851,11 @@ def rollout_stages_with_pixel_decoder(
 
         rollout.append(step)
         current_embedding = np.asarray(match["embedding"] if use_retrieved_embedding and match is not None else pred_np, dtype=np.float32)
+        sequence_embeddings.append(current_embedding)
+        sequence_stages.append(int(predicted_stage))
+        if max_seq_len > 0 and len(sequence_embeddings) > max_seq_len:
+            sequence_embeddings = sequence_embeddings[-max_seq_len:]
+            sequence_stages = sequence_stages[-max_seq_len:]
         prev_retrieved_embedding = np.asarray(match["embedding"], dtype=np.float32) if match is not None else prev_retrieved_embedding
         current_image = generated.detach()
 
@@ -706,36 +869,80 @@ def main() -> None:
     ensure_dir(output_dir)
     device = torch.device(args.device)
 
-    model_config = load_model_config(Path(args.metrics_json))
+    metrics_path = Path(args.metrics_json)
+    metrics_summary = load_metrics_summary(metrics_path)
+    model_config = dict(load_model_config(metrics_path))
+    model_config.update(metrics_summary.get("model_config", {}))
+    training_config = metrics_summary.get("training_config", {})
     checkpoint = Path(args.checkpoint)
     embeddings_path = Path(args.embeddings_npz)
-    embedding_backend = resolve_embedding_backend(args.embedding_backend, model_config, embeddings_path)
-    model_id = resolve_model_id(args.model_id, embedding_backend, model_config)
+    model_meta = {**model_config, "training_config": training_config}
+    embedding_backend = resolve_embedding_backend(args.embedding_backend, model_meta, embeddings_path)
+    model_id = resolve_model_id(args.model_id, embedding_backend, model_meta)
+    transition_model_family = resolve_transition_model_family(args.transition_model, model_config)
+    feature_transform_name, embedding_transform = load_embedding_transform(metrics_summary, metrics_path)
 
-    stage_bank = load_frame_bank(embeddings_path, Path(args.manifest_frames), args.retrieval_split)
+    stage_bank = transform_stage_bank(
+        load_frame_bank(embeddings_path, Path(args.manifest_frames), args.retrieval_split),
+        embedding_transform,
+    )
     stage_chain = build_stage_chain(args.start_stage, args.end_stage, int(model_config["num_stages"]), stage_bank)
 
     embedding_dim = int(np.asarray(next(iter(stage_bank.values()))["embeddings"]).shape[1])
-    model = TransitionMLP(
-        embedding_dim=embedding_dim,
-        hidden_dim=int(model_config["hidden_dim"]),
-        stage_embed_dim=int(model_config["stage_embed_dim"]),
-        dropout=float(model_config["dropout"]),
-        num_stages=int(model_config["num_stages"]),
-    ).to(device)
-
-    load_transition_mlp_checkpoint(model, checkpoint, device)
+    max_seq_len = int(model_config.get("max_seq_len", 1))
+    if transition_model_family == "transformer":
+        model = TransitionSequenceTransformer(
+            embedding_dim=embedding_dim,
+            model_dim=int(model_config["model_dim"]),
+            num_layers=int(model_config["num_layers"]),
+            num_heads=int(model_config["num_heads"]),
+            ff_dim=int(model_config["ff_dim"]),
+            dropout=float(model_config["dropout"]),
+            num_stages=int(model_config["num_stages"]),
+            max_seq_len=max_seq_len,
+            stage_embed_dim=int(model_config["stage_embed_dim"]),
+            stage_specific_output_heads=bool(model_config.get("stage_specific_output_heads", True)),
+            use_stage_conditioning=bool(model_config.get("use_stage_conditioning", True)),
+        ).to(device)
+        load_transition_sequence_checkpoint(model, checkpoint, device)
+    elif transition_model_family == "cnn":
+        model = TransitionSequenceCNN(
+            embedding_dim=embedding_dim,
+            model_dim=int(model_config["model_dim"]),
+            num_layers=int(model_config["num_layers"]),
+            kernel_size=int(model_config.get("cnn_kernel_size", 3)),
+            dilation_cycle=int(model_config.get("cnn_dilation_cycle", 3)),
+            dropout=float(model_config["dropout"]),
+            num_stages=int(model_config["num_stages"]),
+            max_seq_len=max_seq_len,
+            stage_embed_dim=int(model_config["stage_embed_dim"]),
+            stage_specific_output_heads=bool(model_config.get("stage_specific_output_heads", True)),
+            use_stage_conditioning=bool(model_config.get("use_stage_conditioning", True)),
+        ).to(device)
+        load_transition_sequence_checkpoint(model, checkpoint, device)
+    else:
+        model = TransitionMLP(
+            embedding_dim=embedding_dim,
+            hidden_dim=int(model_config["hidden_dim"]),
+            stage_embed_dim=int(model_config["stage_embed_dim"]),
+            dropout=float(model_config["dropout"]),
+            num_stages=int(model_config["num_stages"]),
+            use_stage_conditioning=bool(model_config.get("use_stage_conditioning", True)),
+        ).to(device)
+        load_transition_mlp_checkpoint(model, checkpoint, device)
     model.eval()
 
     if embedding_backend == "dino":
         current_embedding = embed_image_with_dino(input_image, model_id, device)
     else:
         current_embedding = embed_image_with_clip(input_image, model_id, device)
+    current_embedding = embedding_transform(np.asarray(current_embedding, dtype=np.float32)).astype(np.float32)
     anchor_embedding = np.asarray(current_embedding, dtype=np.float32).copy()
     structural_threshold = 0.5
 
     if args.render_mode == "retrieval":
         rollout = rollout_stages(
+            model_family=transition_model_family,
             model=model,
             current_embedding=current_embedding,
             anchor_embedding=anchor_embedding,
@@ -743,6 +950,7 @@ def main() -> None:
             stage_chain=stage_chain,
             output_dir=output_dir,
             device=device,
+            max_seq_len=max_seq_len,
             use_retrieved_embedding=args.use_retrieved_embedding,
             retrieval_topk=args.retrieval_topk,
             retrieval_beam_width=args.retrieval_beam_width,
@@ -775,6 +983,7 @@ def main() -> None:
             structural_threshold = float(args.structural_threshold)
 
         rollout = rollout_stages_with_pixel_decoder(
+            model_family=transition_model_family,
             model=model,
             pixel_decoder=pixel_decoder,
             structural_decoder=structural_decoder,
@@ -787,6 +996,7 @@ def main() -> None:
             output_dir=output_dir,
             device=device,
             image_size=image_size,
+            max_seq_len=max_seq_len,
             save_retrieval_fallback=args.save_retrieval_fallback,
             use_retrieved_embedding=args.use_retrieved_embedding,
             structural_until_stage=args.structural_until_stage,
@@ -806,7 +1016,9 @@ def main() -> None:
     summary = {
         "input_image": str(input_image),
         "checkpoint": str(checkpoint),
+        "transition_model": transition_model_family,
         "embedding_backend": embedding_backend,
+        "feature_transform": feature_transform_name,
         "model_id": model_id,
         "device": str(device),
         "render_mode": args.render_mode,

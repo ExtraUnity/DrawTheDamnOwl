@@ -79,6 +79,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage-embed-dim", type=int, default=32, help="Stage embedding size before projection")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout in the transformer")
     parser.add_argument(
+        "--disable_stage_conditioning",
+        action="store_true",
+        help="Train the transformer without stage embeddings. This also forces shared output heads.",
+    )
+    parser.add_argument(
         "--source-feature-dropout",
         type=float,
         default=0.0,
@@ -292,7 +297,16 @@ def resolve_feature_transform(mode: str, embeddings_path: Path) -> str:
     return "standardize" if "dino" in embeddings_path.name.lower() else "none"
 
 
-def resolve_stage_head_mode(mode: str, disable_stage_specific_output_heads: bool, embeddings_path: Path) -> str:
+def resolve_stage_head_mode(
+    mode: str,
+    disable_stage_specific_output_heads: bool,
+    embeddings_path: Path,
+    disable_stage_conditioning: bool,
+) -> str:
+    if disable_stage_conditioning:
+        if mode == "stage-specific":
+            raise ValueError("Cannot use stage-specific output heads when --disable_stage_conditioning is set.")
+        return "shared"
     if disable_stage_specific_output_heads:
         return "shared"
     if mode != "auto":
@@ -652,7 +666,12 @@ def main() -> None:
     examples, skipped_noncontiguous = build_prefix_examples(frame_rows, args.context_window)
     splits = split_rows(examples)
     feature_transform = resolve_feature_transform(args.feature_transform, embeddings_path)
-    stage_head_mode = resolve_stage_head_mode(args.stage_head_mode, args.disable_stage_specific_output_heads, embeddings_path)
+    stage_head_mode = resolve_stage_head_mode(
+        args.stage_head_mode,
+        args.disable_stage_specific_output_heads,
+        embeddings_path,
+        args.disable_stage_conditioning,
+    )
 
     if feature_transform == "standardize":
         feature_mean, feature_std = fit_standardization(splits["train"])
@@ -660,6 +679,12 @@ def main() -> None:
         feature_components = None
         feature_scales = None
         transformed_embedding_dim = embedding_dim
+        np.savez_compressed(
+            output_dir / "feature_transform.npz",
+            mean=feature_mean,
+            std=feature_std,
+            mode=np.array(["standardize"]),
+        )
     elif feature_transform in {"pca", "pca_whiten"}:
         pca_transform = fit_pca_transform(
             splits["train"],
@@ -737,6 +762,7 @@ def main() -> None:
         max_seq_len=max_seq_len,
         stage_embed_dim=args.stage_embed_dim,
         stage_specific_output_heads=(stage_head_mode == "stage-specific"),
+        use_stage_conditioning=not args.disable_stage_conditioning,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -799,6 +825,7 @@ def main() -> None:
         "manifest_frames": args.manifest_frames,
         "device": str(device),
         "model_config": {
+            "sequence_model": "transformer",
             "model_dim": args.model_dim,
             "num_layers": args.num_layers,
             "num_heads": args.num_heads,
@@ -810,6 +837,7 @@ def main() -> None:
             "max_seq_len": max_seq_len,
             "stage_head_mode": stage_head_mode,
             "stage_specific_output_heads": (stage_head_mode == "stage-specific"),
+            "use_stage_conditioning": not args.disable_stage_conditioning,
         },
         "training_config": {
             "batch_size": args.batch_size,
@@ -830,6 +858,7 @@ def main() -> None:
             "source_feature_dropout": args.source_feature_dropout,
             "source_noise_std": args.source_noise_std,
             "stage_head_mode": stage_head_mode,
+            "disable_stage_conditioning": bool(args.disable_stage_conditioning),
             "selection_metric": args.selection_metric,
             "blend_retrieval_weight": args.blend_retrieval_weight,
             "blend_cosine_weight": args.blend_cosine_weight,
@@ -846,7 +875,7 @@ def main() -> None:
             "scale_mean": float(np.mean(feature_scales)) if feature_scales is not None else None,
             "scale_min": float(np.min(feature_scales)) if feature_scales is not None else None,
             "scale_max": float(np.max(feature_scales)) if feature_scales is not None else None,
-            "transform_path": str(output_dir / "feature_transform.npz") if feature_components is not None else None,
+            "transform_path": str(output_dir / "feature_transform.npz") if feature_transform in {"standardize", "pca", "pca_whiten"} else None,
         },
         "num_train": len(splits["train"]),
         "num_val": len(splits["val"]),
