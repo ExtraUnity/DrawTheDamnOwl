@@ -21,7 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from models.autoencoder import ConvAutoencoder
-from models.latent_transition import SpatialLatentTransition
+from models.latent_transition import LatentUNetTransition, SpatialLatentTransition
 from scripts.learning_utils import default_device, ssim_loss
 from scripts.script_utils import LEARNING_ROOT, ensure_dir, read_csv_rows, require_file, write_csv, write_json
 
@@ -55,21 +55,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--image_size", type=int, default=128, help="Square input resolution. Must be divisible by 2**num_downsamples.")
     parser.add_argument("--channels", type=int, choices=[1, 3], default=3, help="Load images as grayscale or RGB.")
-    parser.add_argument(
-        "--num_downsamples",
-        type=int,
-        default=0,
-        help="Autoencoder downsample stages. Set <= 0 to choose a depth that keeps the latent map near 16x16.",
-    )
+    parser.add_argument("--num_downsamples", type=int, default=3, help="Number of autoencoder downsample stages.")
     parser.add_argument("--latent_channels", type=int, default=64, help="Number of channels in the spatial latent map.")
     parser.add_argument("--base_channels", type=int, default=32, help="Base width for the convolutional autoencoder.")
-    parser.add_argument("--transition_hidden_channels", type=int, default=64, help="Hidden width for the latent transition CNN.")
+    parser.add_argument("--transition_model", choices=["cnn", "unet"], default="cnn", help="Transition model architecture.")
+    parser.add_argument("--transition_hidden_channels", type=int, default=64, help="Hidden width for the CNN transition model.")
     parser.add_argument("--transition_blocks", type=int, default=4, help="Number of residual blocks in the latent transition CNN.")
     parser.add_argument(
-        "--stage_embed_dim",
+        "--transition_base_channels",
         type=int,
-        default=32,
-        help="Sinusoidal stage/timestep embedding width for transition and decoder conditioning.",
+        default=0,
+        help="Base width for the latent U-Net transition model. Set <= 0 to use latent_channels.",
+    )
+    parser.add_argument(
+        "--transition_bottleneck_blocks",
+        type=int,
+        default=2,
+        help="Number of bottleneck residual blocks in the latent U-Net transition model.",
     )
     parser.add_argument(
         "--transition_residual",
@@ -77,20 +79,13 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Predict the next latent as z1 + f(z1) instead of predicting z2 directly.",
     )
+    parser.add_argument("--use_stage_conditioning", action="store_true", help="Condition the transition model on the source/target stage pair.")
+    parser.add_argument("--stage_embed_dim", type=int, default=16, help="Embedding width for stage-pair conditioning.")
     parser.add_argument(
-        "--disable_stage_conditioning",
-        action="store_true",
-        help="Disable explicit source-stage conditioning in the latent transition model.",
-    )
-    parser.add_argument(
-        "--enable_decoder_stage_conditioning",
-        action="store_true",
-        help="Enable target-stage conditioning in the decoder. Off by default because it can hurt autoencoder reconstruction.",
-    )
-    parser.add_argument(
-        "--disable_decoder_stage_conditioning",
-        action="store_true",
-        help="Legacy no-op when decoder stage conditioning is not enabled; kept for CLI compatibility.",
+        "--num_stage_transitions",
+        type=int,
+        default=0,
+        help="Number of stage-transition ids. Set <= 0 to infer from the dataset.",
     )
     parser.add_argument("--batch_size", type=int, default=16, help="Mini-batch size.")
     parser.add_argument("--epochs_autoencoder", type=int, default=100, help="Number of autoencoder epochs.")
@@ -134,6 +129,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Legacy option: allow encoder/decoder weights to update during the main transition phase.",
     )
+    parser.add_argument(
+        "--transition_only",
+        action="store_true",
+        help="Skip autoencoder training and train only the latent transition model using a pretrained autoencoder checkpoint.",
+    )
+    parser.add_argument(
+        "--autoencoder_checkpoint",
+        default="",
+        help="Path to a pretrained autoencoder checkpoint. Required when --transition_only is set.",
+    )
     parser.add_argument("--finetune_decoder_epochs", type=int, default=0, help="Extra epochs that jointly fine-tune the transition model and decoder with the encoder frozen.")
     parser.add_argument("--finetune_transition_lr", type=float, default=1e-4, help="Learning rate for transition weights during the decoder fine-tuning stage.")
     parser.add_argument("--finetune_decoder_lr", type=float, default=1e-5, help="Learning rate for decoder weights during the decoder fine-tuning stage.")
@@ -149,16 +154,6 @@ def set_seed(seed: int) -> None:
     if hasattr(torch.backends, "cudnn"):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-
-
-def resolve_num_downsamples(image_size: int, requested_num_downsamples: int) -> int:
-    if requested_num_downsamples > 0:
-        return int(requested_num_downsamples)
-
-    num_downsamples = 3
-    while image_size % (2 ** (num_downsamples + 1)) == 0 and (image_size // (2**num_downsamples)) > 16:
-        num_downsamples += 1
-    return num_downsamples
 
 
 def validate_fractions(train_fraction: float, val_fraction: float, test_fraction: float) -> None:
@@ -343,22 +338,36 @@ def build_unique_image_rows(pair_splits: Dict[str, List[Dict[str, Any]]]) -> Dic
     unique_by_split: Dict[str, Dict[str, Dict[str, Any]]] = {split_name: {} for split_name in SPLIT_NAMES}
     for split_name, rows in pair_splits.items():
         for row in rows:
-            image_specs = (
-                ("source_path", row["source_stage"]),
-                ("target_path", row["target_stage"]),
-            )
-            for key, stage_idx in image_specs:
+            for key in ("source_path", "target_path"):
                 image_path = Path(row[key])
                 image_key = str(image_path)
                 if image_key not in unique_by_split[split_name]:
-                    unique_by_split[split_name][image_key] = {
-                        "image_path": image_path,
-                        "split": split_name,
-                        "stage_idx": stage_idx,
-                    }
-                elif unique_by_split[split_name][image_key]["stage_idx"] != stage_idx:
-                    raise RuntimeError(f"Conflicting stage annotations for image: {image_path}")
+                    unique_by_split[split_name][image_key] = {"image_path": image_path, "split": split_name}
     return {split_name: list(items.values()) for split_name, items in unique_by_split.items()}
+
+
+def build_stage_transition_mapping(
+    rows: Sequence[Mapping[str, Any]],
+    requested_num_stage_transitions: int,
+) -> Tuple[Dict[Tuple[int, int], int], Dict[str, int]]:
+    pairs: List[Tuple[int, int]] = []
+    for row in rows:
+        source_stage = row.get("source_stage")
+        target_stage = row.get("target_stage")
+        if source_stage is None or target_stage is None:
+            raise RuntimeError("--use_stage_conditioning requires source_stage and target_stage columns for every pair.")
+        pairs.append((int(source_stage), int(target_stage)))
+
+    unique_pairs = sorted(set(pairs))
+    mapping = {pair: idx for idx, pair in enumerate(unique_pairs)}
+    if requested_num_stage_transitions > 0 and len(mapping) > requested_num_stage_transitions:
+        raise RuntimeError(
+            f"Found {len(mapping)} stage transitions in the dataset, which exceeds "
+            f"--num_stage_transitions={requested_num_stage_transitions}."
+        )
+
+    serializable = {f"{source_stage}->{target_stage}": idx for (source_stage, target_stage), idx in mapping.items()}
+    return mapping, serializable
 
 
 def load_image_tensor(path: Path, image_size: int, channels: int) -> torch.Tensor:
@@ -477,11 +486,7 @@ class UniqueImageDataset(Dataset):
         image = load_image_tensor(Path(row["image_path"]), self.image_size, self.channels)
         if self.training:
             image = apply_augmentation([image], self.augment_config, self.channels)[0]
-        return {
-            "image": image,
-            "image_path": str(row["image_path"]),
-            "stage_idx": -1 if row["stage_idx"] is None else int(row["stage_idx"]),
-        }
+        return {"image": image, "image_path": str(row["image_path"])}
 
 
 class StagePairDataset(Dataset):
@@ -492,12 +497,16 @@ class StagePairDataset(Dataset):
         channels: int,
         augment_config: AugmentConfig,
         training: bool,
+        stage_transition_mapping: Mapping[Tuple[int, int], int] | None = None,
+        require_stage_columns: bool = False,
     ):
         self.rows = rows
         self.image_size = image_size
         self.channels = channels
         self.augment_config = augment_config
         self.training = training
+        self.stage_transition_mapping = stage_transition_mapping
+        self.require_stage_columns = require_stage_columns
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -508,13 +517,26 @@ class StagePairDataset(Dataset):
         target = load_image_tensor(Path(row["target_path"]), self.image_size, self.channels)
         if self.training:
             source, target = apply_augmentation([source, target], self.augment_config, self.channels)
+        source_stage = row["source_stage"]
+        target_stage = row["target_stage"]
+        transition_id = -1
+        if self.stage_transition_mapping is not None:
+            if source_stage is None or target_stage is None:
+                raise RuntimeError("--use_stage_conditioning requires source_stage and target_stage columns for every pair.")
+            pair = (int(source_stage), int(target_stage))
+            if pair not in self.stage_transition_mapping:
+                raise RuntimeError(f"Encountered unseen stage transition {pair} outside the stage-conditioning mapping.")
+            transition_id = int(self.stage_transition_mapping[pair])
+        elif self.require_stage_columns and (source_stage is None or target_stage is None):
+            raise RuntimeError("--use_stage_conditioning requires source_stage and target_stage columns for every pair.")
         return {
             "source": source,
             "target": target,
             "source_path": str(row["source_path"]),
             "target_path": str(row["target_path"]),
-            "source_stage": -1 if row["source_stage"] is None else int(row["source_stage"]),
-            "target_stage": -1 if row["target_stage"] is None else int(row["target_stage"]),
+            "source_stage": -1 if source_stage is None else int(source_stage),
+            "target_stage": -1 if target_stage is None else int(target_stage),
+            "transition_id": transition_id,
             "transition_key": str(row["transition_key"]),
         }
 
@@ -700,18 +722,17 @@ def get_decoder_parameters(model: ConvAutoencoder) -> List[nn.Parameter]:
 
 def forward_pair_models(
     autoencoder: ConvAutoencoder,
-    transition: SpatialLatentTransition,
+    transition: nn.Module,
     source: torch.Tensor,
     target: torch.Tensor,
-    source_stage: torch.Tensor | None = None,
-    target_stage: torch.Tensor | None = None,
+    transition_ids: torch.Tensor | None = None,
 ) -> Dict[str, torch.Tensor]:
     z1 = autoencoder.encode(source)
     z2 = autoencoder.encode(target)
-    z2_pred = transition(z1, source_stage)
-    source_decode = autoencoder.decode(z1, source_stage)
-    target_recon = autoencoder.decode(z2, target_stage)
-    transition_pred = autoencoder.decode(z2_pred, target_stage)
+    z2_pred = transition(z1, transition_ids)
+    source_decode = autoencoder.decode(z1)
+    target_recon = autoencoder.decode(z2)
+    transition_pred = autoencoder.decode(z2_pred)
     return {
         "z1": z1,
         "z2": z2,
@@ -759,8 +780,7 @@ def save_autoencoder_samples(
         for row_idx in range(count):
             sample = dataset[row_idx]
             image = sample["image"].unsqueeze(0).to(device)
-            stage_idx = torch.tensor([int(sample["stage_idx"])], dtype=torch.long, device=device)
-            recon = model(image, latent_noise_std=latent_noise_std, stage_idx=stage_idx)[0].cpu()
+            recon = model(image, latent_noise_std=latent_noise_std)[0].cpu()
             images = [sample["image"], recon, tensor_abs_diff(recon, sample["image"])]
             labels = ["input", "recon", "abs diff"]
             y = row_idx * (tile_size + label_height)
@@ -776,7 +796,7 @@ def save_autoencoder_samples(
 
 def save_transition_samples(
     autoencoder: ConvAutoencoder,
-    transition: SpatialLatentTransition,
+    transition: nn.Module,
     dataset: StagePairDataset,
     device: torch.device,
     output_path: Path,
@@ -799,9 +819,10 @@ def save_transition_samples(
             sample = dataset[row_idx]
             source = sample["source"].unsqueeze(0).to(device)
             target = sample["target"].unsqueeze(0).to(device)
-            source_stage = torch.tensor([int(sample["source_stage"])], dtype=torch.long, device=device)
-            target_stage = torch.tensor([int(sample["target_stage"])], dtype=torch.long, device=device)
-            outputs = forward_pair_models(autoencoder, transition, source, target, source_stage, target_stage)
+            transition_ids = None
+            if int(sample["transition_id"]) >= 0:
+                transition_ids = torch.tensor([int(sample["transition_id"])], dtype=torch.long, device=device)
+            outputs = forward_pair_models(autoencoder, transition, source, target, transition_ids)
             images = [
                 sample["source"],
                 sample["target"],
@@ -834,8 +855,7 @@ def train_autoencoder_epoch(
     metrics: List[Dict[str, float]] = []
     for batch in maybe_tqdm(loader, desc=f"ae train {epoch:03d}"):
         image = batch["image"].to(device)
-        stage_idx = batch["stage_idx"].to(device)
-        recon = model(image, latent_noise_std=args.latent_noise_std, stage_idx=stage_idx)
+        recon = model(image, latent_noise_std=args.latent_noise_std)
         terms = compute_image_terms(recon, image, args.foreground_threshold, args.foreground_dilate)
         loss = autoencoder_total_loss(terms, args.autoencoder_mse_weight, args.lambda_foreground, args.lambda_edge)
 
@@ -860,8 +880,7 @@ def evaluate_autoencoder(
     with torch.no_grad():
         for batch in maybe_tqdm(loader, desc="ae eval"):
             image = batch["image"].to(device)
-            stage_idx = batch["stage_idx"].to(device)
-            recon = model(image, latent_noise_std=0.0, stage_idx=stage_idx)
+            recon = model(image, latent_noise_std=0.0)
             terms = compute_image_terms(recon, image, args.foreground_threshold, args.foreground_dilate)
             loss = autoencoder_total_loss(terms, args.autoencoder_mse_weight, args.lambda_foreground, args.lambda_edge)
             batch_metrics = reconstruction_metrics_from_terms(terms)
@@ -872,7 +891,7 @@ def evaluate_autoencoder(
 
 def train_transition_epoch(
     autoencoder: ConvAutoencoder,
-    transition: SpatialLatentTransition,
+    transition: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
@@ -889,17 +908,19 @@ def train_transition_epoch(
     for batch in maybe_tqdm(loader, desc=f"tr train {epoch:03d}"):
         source = batch["source"].to(device)
         target = batch["target"].to(device)
-        source_stage = batch["source_stage"].to(device)
-        target_stage = batch["target_stage"].to(device)
+        transition_ids = None
+        if "transition_id" in batch:
+            transition_ids_raw = batch["transition_id"].to(device)
+            transition_ids = transition_ids_raw if torch.all(transition_ids_raw >= 0) else None
 
         if args.finetune_autoencoder_during_transition:
-            outputs = forward_pair_models(autoencoder, transition, source, target, source_stage, target_stage)
+            outputs = forward_pair_models(autoencoder, transition, source, target, transition_ids)
         else:
             with torch.no_grad():
                 z1 = autoencoder.encode(source)
                 z2 = autoencoder.encode(target)
-            z2_pred = transition(z1, source_stage)
-            target_pred = autoencoder.decode(z2_pred, target_stage)
+            z2_pred = transition(z1, transition_ids)
+            target_pred = autoencoder.decode(z2_pred)
             outputs = {"z1": z1, "z2": z2, "z2_pred": z2_pred, "transition_pred": target_pred}
 
         terms = compute_image_terms(outputs["transition_pred"], target, args.foreground_threshold, args.foreground_dilate)
@@ -919,7 +940,7 @@ def train_transition_epoch(
 
 def train_decoder_finetune_epoch(
     autoencoder: ConvAutoencoder,
-    transition: SpatialLatentTransition,
+    transition: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
@@ -932,15 +953,17 @@ def train_decoder_finetune_epoch(
     for batch in maybe_tqdm(loader, desc=f"ft train {epoch:03d}"):
         source = batch["source"].to(device)
         target = batch["target"].to(device)
-        source_stage = batch["source_stage"].to(device)
-        target_stage = batch["target_stage"].to(device)
+        transition_ids = None
+        if "transition_id" in batch:
+            transition_ids_raw = batch["transition_id"].to(device)
+            transition_ids = transition_ids_raw if torch.all(transition_ids_raw >= 0) else None
 
         with torch.no_grad():
             z1 = autoencoder.encode(source)
             z2 = autoencoder.encode(target)
 
-        z2_pred = transition(z1, source_stage)
-        target_pred = autoencoder.decode(z2_pred, target_stage)
+        z2_pred = transition(z1, transition_ids)
+        target_pred = autoencoder.decode(z2_pred)
         terms = compute_image_terms(target_pred, target, args.foreground_threshold, args.foreground_dilate)
         latent_loss = F.mse_loss(z2_pred, z2)
         cosine = F.cosine_similarity(z2_pred.flatten(1), z2.flatten(1), dim=1).mean()
@@ -958,7 +981,7 @@ def train_decoder_finetune_epoch(
 
 def evaluate_pair_models(
     autoencoder: ConvAutoencoder,
-    transition: SpatialLatentTransition,
+    transition: nn.Module,
     loader: DataLoader,
     device: torch.device,
     args: argparse.Namespace,
@@ -973,9 +996,11 @@ def evaluate_pair_models(
         for batch in maybe_tqdm(loader, desc="pair eval"):
             source = batch["source"].to(device)
             target = batch["target"].to(device)
-            source_stage = batch["source_stage"].to(device)
-            target_stage = batch["target_stage"].to(device)
-            outputs = forward_pair_models(autoencoder, transition, source, target, source_stage, target_stage)
+            transition_ids = None
+            if "transition_id" in batch:
+                transition_ids_raw = batch["transition_id"].to(device)
+                transition_ids = transition_ids_raw if torch.all(transition_ids_raw >= 0) else None
+            outputs = forward_pair_models(autoencoder, transition, source, target, transition_ids)
 
             target_terms = compute_image_terms(outputs["target_recon"], target, args.foreground_threshold, args.foreground_dilate)
             source_terms = compute_image_terms(outputs["source_decode"], target, args.foreground_threshold, args.foreground_dilate)
@@ -1008,6 +1033,19 @@ def evaluate_pair_models(
 def save_checkpoint(path: Path, model: nn.Module, extra: Dict[str, Any]) -> None:
     ensure_dir(path.parent)
     torch.save({"model_state_dict": model.state_dict(), **extra}, path)
+
+
+def load_checkpoint(path: Path, model: nn.Module, device: torch.device, description: str) -> Dict[str, Any]:
+    require_file(path, description)
+    checkpoint = torch.load(path, map_location=device)
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif isinstance(checkpoint, dict):
+        state_dict = checkpoint
+    else:
+        raise RuntimeError(f"{description} at {path} did not contain a supported checkpoint format.")
+    model.load_state_dict(state_dict)
+    return checkpoint if isinstance(checkpoint, dict) else {}
 
 
 def print_split_summary(pair_splits: Dict[str, List[Dict[str, Any]]], image_splits: Dict[str, List[Dict[str, Any]]]) -> None:
@@ -1049,7 +1087,7 @@ def print_comparison_table(split_name: str, comparison: Mapping[str, Mapping[str
 
 def save_split_sample_sheets(
     autoencoder: ConvAutoencoder,
-    transition: SpatialLatentTransition,
+    transition: nn.Module,
     pair_datasets: Dict[str, StagePairDataset],
     device: torch.device,
     output_dir: Path,
@@ -1069,10 +1107,15 @@ def save_split_sample_sheets(
 def main() -> None:
     args = parse_args()
     validate_fractions(args.train_fraction, args.val_fraction, args.test_fraction)
-    args.num_downsamples = resolve_num_downsamples(args.image_size, int(args.num_downsamples))
     downsample_factor = 2 ** int(args.num_downsamples)
     if args.image_size % downsample_factor != 0:
         raise ValueError(f"--image_size must be divisible by {downsample_factor} for num_downsamples={args.num_downsamples}.")
+    if args.transition_only and not args.autoencoder_checkpoint:
+        raise ValueError("--transition_only requires --autoencoder_checkpoint.")
+    if args.transition_only and args.finetune_autoencoder_during_transition:
+        raise ValueError("--transition_only cannot be combined with --finetune_autoencoder_during_transition.")
+    if args.transition_only and args.finetune_decoder_epochs > 0:
+        raise ValueError("--transition_only cannot be combined with --finetune_decoder_epochs > 0.")
 
     set_seed(args.seed)
     data_dir = Path(args.data_dir)
@@ -1104,17 +1147,15 @@ def main() -> None:
     )
     pair_splits = split_rows(rows)
     image_splits = build_unique_image_rows(pair_splits)
-    source_stages = [int(row["source_stage"]) for row in rows if row["source_stage"] is not None]
-    target_stages = [int(row["target_stage"]) for row in rows if row["target_stage"] is not None]
-    all_stage_values = source_stages + target_stages
-    has_all_stage_annotations = len(source_stages) == len(rows) and len(target_stages) == len(rows)
-    use_transition_stage_conditioning = (len(source_stages) == len(rows)) and not bool(args.disable_stage_conditioning)
-    use_decoder_stage_conditioning = (
-        has_all_stage_annotations
-        and bool(args.enable_decoder_stage_conditioning)
-        and not bool(args.disable_decoder_stage_conditioning)
-    )
-    num_stages = (max(all_stage_values) + 1) if all_stage_values else None
+    stage_transition_mapping: Dict[Tuple[int, int], int] | None = None
+    stage_transition_mapping_serializable: Dict[str, int] | None = None
+    num_stage_transitions = 0
+    if args.use_stage_conditioning:
+        stage_transition_mapping, stage_transition_mapping_serializable = build_stage_transition_mapping(
+            pair_splits["train"],
+            requested_num_stage_transitions=int(args.num_stage_transitions),
+        )
+        num_stage_transitions = int(args.num_stage_transitions) if int(args.num_stage_transitions) > 0 else len(stage_transition_mapping)
 
     image_datasets = {
         "train": UniqueImageDataset(image_splits["train"], args.image_size, args.channels, augment_config, training=True),
@@ -1127,12 +1168,44 @@ def main() -> None:
         "test": image_datasets["test"],
     }
     pair_datasets = {
-        "train": StagePairDataset(pair_splits["train"], args.image_size, args.channels, augment_config, training=True),
-        "val": StagePairDataset(pair_splits["val"], args.image_size, args.channels, augment_config, training=False),
-        "test": StagePairDataset(pair_splits["test"], args.image_size, args.channels, augment_config, training=False),
+        "train": StagePairDataset(
+            pair_splits["train"],
+            args.image_size,
+            args.channels,
+            augment_config,
+            training=True,
+            stage_transition_mapping=stage_transition_mapping,
+            require_stage_columns=bool(args.use_stage_conditioning),
+        ),
+        "val": StagePairDataset(
+            pair_splits["val"],
+            args.image_size,
+            args.channels,
+            augment_config,
+            training=False,
+            stage_transition_mapping=stage_transition_mapping,
+            require_stage_columns=bool(args.use_stage_conditioning),
+        ),
+        "test": StagePairDataset(
+            pair_splits["test"],
+            args.image_size,
+            args.channels,
+            augment_config,
+            training=False,
+            stage_transition_mapping=stage_transition_mapping,
+            require_stage_columns=bool(args.use_stage_conditioning),
+        ),
     }
     pair_eval_datasets = {
-        "train": StagePairDataset(pair_splits["train"], args.image_size, args.channels, augment_config, training=False),
+        "train": StagePairDataset(
+            pair_splits["train"],
+            args.image_size,
+            args.channels,
+            augment_config,
+            training=False,
+            stage_transition_mapping=stage_transition_mapping,
+            require_stage_columns=bool(args.use_stage_conditioning),
+        ),
         "val": pair_datasets["val"],
         "test": pair_datasets["test"],
     }
@@ -1163,8 +1236,8 @@ def main() -> None:
     print(
         f"model setup: num_downsamples={args.num_downsamples} "
         f"latent_resolution={latent_resolution}x{latent_resolution} "
-        f"transition_stage_conditioning={'on' if use_transition_stage_conditioning else 'off'} "
-        f"decoder_stage_conditioning={'on' if use_decoder_stage_conditioning else 'off'}"
+        f"transition_model={args.transition_model} "
+        f"stage_conditioning={'on' if args.use_stage_conditioning else 'off'}"
     )
 
     config = {
@@ -1173,6 +1246,18 @@ def main() -> None:
         "output_dir": str(output_dir),
         "split_info": split_info,
         "args": vars(args),
+        "transition_config": {
+            "transition_model": args.transition_model,
+            "transition_hidden_channels": args.transition_hidden_channels,
+            "transition_blocks": args.transition_blocks,
+            "transition_base_channels": (args.transition_base_channels if args.transition_base_channels > 0 else args.latent_channels),
+            "transition_bottleneck_blocks": args.transition_bottleneck_blocks,
+            "transition_residual": bool(args.transition_residual),
+            "use_stage_conditioning": bool(args.use_stage_conditioning),
+            "stage_embed_dim": args.stage_embed_dim,
+            "resolved_num_stage_transitions": num_stage_transitions if args.use_stage_conditioning else 0,
+        },
+        "stage_transition_mapping": stage_transition_mapping_serializable,
     }
     write_json(output_dir / "config.json", config)
 
@@ -1181,70 +1266,97 @@ def main() -> None:
         base_channels=args.base_channels,
         latent_channels=args.latent_channels,
         num_downsamples=args.num_downsamples,
-        num_stages=num_stages,
-        stage_embed_dim=args.stage_embed_dim,
-        condition_decoder=use_decoder_stage_conditioning,
     ).to(device)
-    transition = SpatialLatentTransition(
-        latent_channels=args.latent_channels,
-        hidden_channels=args.transition_hidden_channels,
-        num_blocks=args.transition_blocks,
-        residual=args.transition_residual,
-        num_stages=num_stages if use_transition_stage_conditioning else None,
-        stage_embed_dim=args.stage_embed_dim,
-    ).to(device)
+    if args.transition_model == "cnn":
+        transition: nn.Module = SpatialLatentTransition(
+            latent_channels=args.latent_channels,
+            hidden_channels=args.transition_hidden_channels,
+            num_blocks=args.transition_blocks,
+            residual=args.transition_residual,
+            num_stage_transitions=(num_stage_transitions if args.use_stage_conditioning else None),
+            stage_embed_dim=args.stage_embed_dim,
+        ).to(device)
+    elif args.transition_model == "unet":
+        transition = LatentUNetTransition(
+            latent_channels=args.latent_channels,
+            base_channels=(args.transition_base_channels if args.transition_base_channels > 0 else args.latent_channels),
+            num_bottleneck_blocks=args.transition_bottleneck_blocks,
+            residual=args.transition_residual,
+            num_stage_transitions=(num_stage_transitions if args.use_stage_conditioning else None),
+            stage_embed_dim=args.stage_embed_dim,
+        ).to(device)
+    else:
+        raise ValueError(f"Unsupported transition_model: {args.transition_model}")
 
     autoencoder_optimizer = torch.optim.AdamW(autoencoder.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     autoencoder_history: List[Dict[str, float]] = []
     best_autoencoder_state = None
-    best_autoencoder_val_loss = float("inf")
-    best_autoencoder_val_l1 = float("inf")
+    best_autoencoder_val_loss = float("nan")
+    best_autoencoder_val_l1 = float("nan")
     sample_image_dataset = image_datasets["val"] if len(image_datasets["val"]) > 0 else image_datasets["train"]
 
-    for epoch in range(1, args.epochs_autoencoder + 1):
-        train_metrics = train_autoencoder_epoch(autoencoder, image_loaders["train"], autoencoder_optimizer, device, args, epoch)
-        val_metrics = evaluate_autoencoder(autoencoder, image_loaders["val"], device, args)
-        epoch_row = {
-            "epoch": float(epoch),
-            **{f"train_{key}": float(value) for key, value in train_metrics.items()},
-            **{f"val_{key}": float(value) for key, value in val_metrics.items()},
-            "lr": float(autoencoder_optimizer.param_groups[0]["lr"]),
-        }
-        autoencoder_history.append(epoch_row)
+    if args.transition_only:
+        checkpoint_path = Path(args.autoencoder_checkpoint)
+        checkpoint = load_checkpoint(checkpoint_path, autoencoder, device, "Autoencoder checkpoint")
+        best_autoencoder_state = clone_state_dict(autoencoder)
+        if "best_val_loss" in checkpoint:
+            best_autoencoder_val_loss = float(checkpoint["best_val_loss"])
+        if "best_val_l1" in checkpoint:
+            best_autoencoder_val_l1 = float(checkpoint["best_val_l1"])
+        print(f"loaded autoencoder checkpoint: {checkpoint_path}")
+    else:
+        best_autoencoder_val_loss = float("inf")
+        best_autoencoder_val_l1 = float("inf")
+        for epoch in range(1, args.epochs_autoencoder + 1):
+            train_metrics = train_autoencoder_epoch(autoencoder, image_loaders["train"], autoencoder_optimizer, device, args, epoch)
+            val_metrics = evaluate_autoencoder(autoencoder, image_loaders["val"], device, args)
+            epoch_row = {
+                "epoch": float(epoch),
+                **{f"train_{key}": float(value) for key, value in train_metrics.items()},
+                **{f"val_{key}": float(value) for key, value in val_metrics.items()},
+                "lr": float(autoencoder_optimizer.param_groups[0]["lr"]),
+            }
+            autoencoder_history.append(epoch_row)
 
-        if float(val_metrics["loss"]) < best_autoencoder_val_loss:
-            best_autoencoder_val_loss = float(val_metrics["loss"])
-            best_autoencoder_val_l1 = float(val_metrics["l1"])
-            best_autoencoder_state = clone_state_dict(autoencoder)
+            if float(val_metrics["loss"]) < best_autoencoder_val_loss:
+                best_autoencoder_val_loss = float(val_metrics["loss"])
+                best_autoencoder_val_l1 = float(val_metrics["l1"])
+                best_autoencoder_state = clone_state_dict(autoencoder)
 
-        print(
-            f"ae epoch {epoch:03d} "
-            f"train_loss={float(train_metrics['loss']):.4f} "
-            f"train_l1={float(train_metrics['l1']):.4f} "
-            f"train_fg_l1={float(train_metrics['foreground_l1']):.4f} "
-            f"val_loss={float(val_metrics['loss']):.4f} "
-            f"val_l1={float(val_metrics['l1']):.4f} "
-            f"val_ssim={float(val_metrics['ssim']):.4f}"
-        )
-
-        if epoch == 1 or epoch == args.epochs_autoencoder or (args.sample_every > 0 and epoch % args.sample_every == 0):
-            save_autoencoder_samples(
-                autoencoder,
-                sample_image_dataset,
-                device,
-                output_dir / "samples_autoencoder" / f"epoch_{epoch:03d}.png",
-                latent_noise_std=0.0,
-                max_samples=args.sample_max_rows,
+            print(
+                f"ae epoch {epoch:03d} "
+                f"train_loss={float(train_metrics['loss']):.4f} "
+                f"train_l1={float(train_metrics['l1']):.4f} "
+                f"train_fg_l1={float(train_metrics['foreground_l1']):.4f} "
+                f"val_loss={float(val_metrics['loss']):.4f} "
+                f"val_l1={float(val_metrics['l1']):.4f} "
+                f"val_ssim={float(val_metrics['ssim']):.4f}"
             )
 
-    if best_autoencoder_state is None:
-        raise RuntimeError("Autoencoder training did not produce a valid checkpoint.")
+            if epoch == 1 or epoch == args.epochs_autoencoder or (args.sample_every > 0 and epoch % args.sample_every == 0):
+                save_autoencoder_samples(
+                    autoencoder,
+                    sample_image_dataset,
+                    device,
+                    output_dir / "samples_autoencoder" / f"epoch_{epoch:03d}.png",
+                    latent_noise_std=0.0,
+                    max_samples=args.sample_max_rows,
+                )
 
-    autoencoder.load_state_dict(best_autoencoder_state)
+        if best_autoencoder_state is None:
+            raise RuntimeError("Autoencoder training did not produce a valid checkpoint.")
+
+        autoencoder.load_state_dict(best_autoencoder_state)
+
     save_checkpoint(
         output_dir / "autoencoder_best.pt",
         autoencoder,
-        {"config": config, "best_val_loss": best_autoencoder_val_loss, "best_val_l1": best_autoencoder_val_l1},
+        {
+            "config": config,
+            "best_val_loss": best_autoencoder_val_loss,
+            "best_val_l1": best_autoencoder_val_l1,
+            "source_checkpoint": args.autoencoder_checkpoint if args.transition_only else "",
+        },
     )
     save_autoencoder_samples(
         autoencoder,
@@ -1258,13 +1370,14 @@ def main() -> None:
     autoencoder_train_metrics = evaluate_autoencoder(autoencoder, image_eval_loaders["train"], device, args)
     autoencoder_val_metrics = evaluate_autoencoder(autoencoder, image_eval_loaders["val"], device, args)
     autoencoder_test_metrics = evaluate_autoencoder(autoencoder, image_eval_loaders["test"], device, args)
-    write_history_csv(output_dir / "autoencoder_history.csv", autoencoder_history)
-    maybe_plot_history(
-        output_dir / "curves" / "autoencoder_history.png",
-        autoencoder_history,
-        title="Autoencoder Training",
-        y_keys=("train_loss", "val_loss", "train_l1", "val_l1", "train_foreground_l1", "val_foreground_l1", "train_edge_l1", "val_edge_l1"),
-    )
+    if autoencoder_history:
+        write_history_csv(output_dir / "autoencoder_history.csv", autoencoder_history)
+        maybe_plot_history(
+            output_dir / "curves" / "autoencoder_history.png",
+            autoencoder_history,
+            title="Autoencoder Training",
+            y_keys=("train_loss", "val_loss", "train_l1", "val_l1", "train_foreground_l1", "val_foreground_l1", "train_edge_l1", "val_edge_l1"),
+        )
 
     if not args.finetune_autoencoder_during_transition:
         set_autoencoder_trainability(autoencoder, train_encoder=False, train_decoder=False)
