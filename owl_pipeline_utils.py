@@ -17,6 +17,8 @@ STAGE_SPECS = [
     {"idx": 3, "action": "add_inner_contours", "folder": "stage_03_inner_contours", "layer_name": "inner_contours"},
     {"idx": 4, "action": "add_value_regions", "folder": "stage_04_value_regions", "layer_name": "value_regions"},
     {"idx": 5, "action": "add_fine_texture", "folder": "stage_05_fine_texture", "layer_name": "fine_texture"},
+    {"idx": 6, "action": "add_color", "folder": "stage_06_color", "layer_name": "color"},
+    {"idx": 7, "action": "add_background", "folder": "stage_07_background", "layer_name": "background"},
 ]
 
 STAGE_BY_INDEX = {spec["idx"]: spec for spec in STAGE_SPECS}

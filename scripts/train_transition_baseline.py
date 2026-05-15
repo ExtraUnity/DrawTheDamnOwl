@@ -4,10 +4,20 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+from PIL import Image
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from learning_utils import TransitionMLP, default_device, load_embedding_archive, normalize_rows
+from learning_utils import (
+    TransitionMLP,
+    combine_stage_features,
+    default_device,
+    extract_clip_image_features,
+    load_clip,
+    load_embedding_archive,
+    normalize_rows,
+)
 from script_utils import LEARNING_ROOT, ensure_dir, read_csv_rows, write_json
 
 
@@ -24,6 +34,11 @@ def parse_args() -> argparse.Namespace:
         help="Path to transition manifest CSV from build_manifest.py",
     )
     parser.add_argument(
+        "--manifest-frames",
+        default=str(LEARNING_ROOT / "manifest_frames.csv"),
+        help="Path to frame manifest CSV from build_manifest.py",
+    )
+    parser.add_argument(
         "--output-dir",
         default=str(LEARNING_ROOT / "ar_baseline"),
         help="Output directory for training artifacts",
@@ -36,7 +51,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=512, help="Hidden width for the MLP predictor")
     parser.add_argument("--stage-embed-dim", type=int, default=16, help="Learned source-stage embedding size")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout in the MLP predictor")
-    parser.add_argument("--patience", type=int, default=25, help="Early stopping patience on validation cosine")
+    parser.add_argument(
+        "--horizontal-flip-augmentation",
+        action="store_true",
+        help="Augment the training split with horizontally flipped CLIP embeddings for both source and target frames",
+    )
+    parser.add_argument("--model-id", default="openai/clip-vit-base-patch32", help="Hugging Face CLIP model id")
+    parser.add_argument("--flip-aug-batch-size", type=int, default=32, help="Batch size when extracting flipped CLIP embeddings")
+    parser.add_argument("--cosine-weight", type=float, default=1.0, help="Weight for cosine regression loss")
+    parser.add_argument("--contrastive-weight", type=float, default=0.25, help="Weight for retrieval ranking loss")
+    parser.add_argument("--temperature", type=float, default=0.05, help="Temperature for contrastive retrieval loss")
+    parser.add_argument(
+        "--selection-metric",
+        choices=["retrieval_at_1", "cosine", "blended"],
+        default="blended",
+        help="Validation metric used for checkpoint selection and early stopping",
+    )
+    parser.add_argument("--blend-retrieval-weight", type=float, default=0.7, help="Retrieval weight in blended checkpoint selection")
+    parser.add_argument("--blend-cosine-weight", type=float, default=0.3, help="Cosine weight in blended checkpoint selection")
+    parser.add_argument("--patience", type=int, default=25, help="Early stopping patience on the selected validation metric")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     return parser.parse_args()
 
@@ -78,6 +111,8 @@ def load_transitions(path: Path, lookup: Dict[Tuple[str, int], np.ndarray]) -> L
                 "transition_key": row["transition_key"],
                 "src_stage_idx": src_stage,
                 "tgt_stage_idx": tgt_stage,
+                "src_image_path": row["src_image_path"],
+                "tgt_image_path": row["tgt_image_path"],
                 "src_embedding": lookup[src_key],
                 "tgt_embedding": lookup[tgt_key],
             }
@@ -86,6 +121,85 @@ def load_transitions(path: Path, lookup: Dict[Tuple[str, int], np.ndarray]) -> L
     if not rows:
         raise RuntimeError("No transition rows loaded.")
     return rows
+
+
+def build_frame_lookup(path: Path) -> Dict[Tuple[str, int], Dict[str, str]]:
+    return {
+        (str(row["stem"]), int(row["stage_idx"])): row
+        for row in read_csv_rows(path, description="Frame manifest")
+    }
+
+
+def batch_iter(items: List[Dict[str, object]], batch_size: int):
+    for i in range(0, len(items), batch_size):
+        yield items[i : i + batch_size]
+
+
+def load_flipped_images(paths: List[str]) -> List[Image.Image]:
+    images: List[Image.Image] = []
+    for path_str in paths:
+        with Image.open(Path(path_str)) as image:
+            images.append(image.convert("RGB").transpose(Image.Transpose.FLIP_LEFT_RIGHT))
+    return images
+
+
+def encode_flipped_stage_batch(
+    rows: List[Dict[str, object]],
+    image_key: str,
+    stage_key: str,
+    frame_lookup: Dict[Tuple[str, int], Dict[str, str]],
+    processor,
+    clip_model,
+    device: torch.device,
+) -> np.ndarray:
+    image_paths = [str(row[image_key]) for row in rows]
+    layer_paths = [
+        str(frame_lookup[(str(row["stem"]), int(row[stage_key]))]["layer_path"])
+        for row in rows
+    ]
+
+    images = load_flipped_images(image_paths)
+    layer_images = load_flipped_images(layer_paths)
+    image_inputs = processor(images=images, return_tensors="pt", padding=True)
+    image_inputs = {key: value.to(device) for key, value in image_inputs.items()}
+    layer_inputs = processor(images=layer_images, return_tensors="pt", padding=True)
+    layer_inputs = {key: value.to(device) for key, value in layer_inputs.items()}
+
+    with torch.no_grad():
+        image_features = extract_clip_image_features(clip_model, image_inputs).detach().cpu().numpy().astype(np.float32)
+        layer_features = extract_clip_image_features(clip_model, layer_inputs).detach().cpu().numpy().astype(np.float32)
+
+    out: List[np.ndarray] = []
+    for image_feature, layer_feature in zip(image_features, layer_features):
+        out.append(combine_stage_features(image_feature, layer_feature))
+    return np.stack(out, axis=0).astype(np.float32)
+
+
+def augment_rows_with_horizontal_flips(
+    rows: List[Dict[str, object]],
+    frame_lookup: Dict[Tuple[str, int], Dict[str, str]],
+    model_id: str,
+    device: torch.device,
+    batch_size: int,
+) -> List[Dict[str, object]]:
+    if not rows:
+        return []
+
+    processor, clip_model = load_clip(model_id, device)
+    augmented: List[Dict[str, object]] = []
+    for batch in batch_iter(rows, batch_size):
+        src_embeddings = encode_flipped_stage_batch(batch, "src_image_path", "src_stage_idx", frame_lookup, processor, clip_model, device)
+        tgt_embeddings = encode_flipped_stage_batch(batch, "tgt_image_path", "tgt_stage_idx", frame_lookup, processor, clip_model, device)
+        for row, src_embedding, tgt_embedding in zip(batch, src_embeddings, tgt_embeddings):
+            augmented.append(
+                {
+                    **row,
+                    "transition_key": f"{row['transition_key']}__hflip",
+                    "src_embedding": src_embedding,
+                    "tgt_embedding": tgt_embedding,
+                }
+            )
+    return augmented
 
 
 class TransitionDataset(Dataset):
@@ -146,24 +260,57 @@ def build_eval_artifacts(rows: List[Dict[str, object]]) -> Tuple[Dict[int, np.nd
     return build_stage_centroids(rows), *collect_target_bank(rows)
 
 
-def train_one_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim.Optimizer, device: torch.device) -> float:
+def retrieval_contrastive_loss(
+    pred: torch.Tensor,
+    tgt: torch.Tensor,
+    tgt_stage: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    logits = (pred @ tgt.T) / float(temperature)
+    same_stage = tgt_stage.unsqueeze(0) == tgt_stage.unsqueeze(1)
+    eye = torch.eye(logits.shape[0], dtype=torch.bool, device=logits.device)
+    valid = same_stage | eye
+    logits = logits.masked_fill(~valid, float("-inf"))
+    labels = torch.arange(logits.shape[0], device=logits.device)
+    return F.cross_entropy(logits, labels)
+
+
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    args: argparse.Namespace,
+) -> Dict[str, float]:
     model.train()
-    losses: List[float] = []
+    losses: List[Dict[str, float]] = []
 
     for batch in loader:
         src = batch["src_embedding"].to(device)
         tgt = batch["tgt_embedding"].to(device)
         src_stage = batch["src_stage_idx"].to(device)
+        tgt_stage = batch["tgt_stage_idx"].to(device)
 
         pred = model(src, src_stage)
-        loss = 1.0 - torch.sum(pred * tgt, dim=-1).mean()
+        cosine_loss = 1.0 - torch.sum(pred * tgt, dim=-1).mean()
+        contrastive_loss = retrieval_contrastive_loss(pred, tgt, tgt_stage, args.temperature)
+        loss = float(args.cosine_weight) * cosine_loss + float(args.contrastive_weight) * contrastive_loss
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        losses.append(float(loss.detach().cpu().item()))
+        losses.append(
+            {
+                "loss": float(loss.detach().cpu().item()),
+                "cosine_loss": float(cosine_loss.detach().cpu().item()),
+                "contrastive_loss": float(contrastive_loss.detach().cpu().item()),
+            }
+        )
 
-    return float(np.mean(losses)) if losses else float("nan")
+    if not losses:
+        return {"loss": float("nan"), "cosine_loss": float("nan"), "contrastive_loss": float("nan")}
+    keys = losses[0].keys()
+    return {key: float(np.mean([item[key] for item in losses])) for key in keys}
 
 
 def evaluate(
@@ -178,6 +325,7 @@ def evaluate(
     cosines: List[float] = []
     centroid_correct = 0
     exact_retrieval_correct = 0
+    retrieval_at_5_correct = 0
     total = 0
 
     stages = sorted(stage_centroids.keys())
@@ -202,16 +350,37 @@ def evaluate(
 
             retrieval_scores = pred_np @ target_bank.T
             retrieval_idx = np.argmax(retrieval_scores, axis=1)
+            topk = min(5, retrieval_scores.shape[1])
+            retrieval_topk_idx = np.argpartition(retrieval_scores, -topk, axis=1)[:, -topk:]
             batch_keys = batch["transition_key"]
             exact_retrieval_correct += sum(target_keys[idx] == key for idx, key in zip(retrieval_idx, batch_keys))
+            retrieval_at_5_correct += sum(
+                key in {target_keys[idx] for idx in row_idx}
+                for row_idx, key in zip(retrieval_topk_idx, batch_keys)
+            )
             total += pred_np.shape[0]
 
     return {
         "mean_target_cosine": float(np.mean(cosines)) if cosines else float("nan"),
         "centroid_stage_accuracy": float(centroid_correct / max(total, 1)),
         "exact_target_retrieval_at_1": float(exact_retrieval_correct / max(total, 1)),
+        "exact_target_retrieval_at_5": float(retrieval_at_5_correct / max(total, 1)),
         "num_samples": int(total),
     }
+
+
+def metric_value(metrics: Dict[str, float], args: argparse.Namespace) -> float:
+    selection_metric = args.selection_metric
+    if selection_metric == "retrieval_at_1":
+        return float(metrics["exact_target_retrieval_at_1"])
+    if selection_metric == "cosine":
+        return float(metrics["mean_target_cosine"])
+    if selection_metric == "blended":
+        return (
+            float(args.blend_retrieval_weight) * float(metrics["exact_target_retrieval_at_1"])
+            + float(args.blend_cosine_weight) * float(metrics["mean_target_cosine"])
+        )
+    raise ValueError(f"Unknown selection metric: {selection_metric}")
 
 
 def main() -> None:
@@ -225,8 +394,23 @@ def main() -> None:
     lookup, embedding_dim = load_embedding_lookup(Path(args.embeddings_npz))
     rows = load_transitions(Path(args.transitions_csv), lookup)
     splits = split_rows(rows)
+    train_rows = list(splits["train"])
+    if args.horizontal_flip_augmentation:
+        frame_lookup = build_frame_lookup(Path(args.manifest_frames))
+        flipped_rows = augment_rows_with_horizontal_flips(
+            train_rows,
+            frame_lookup=frame_lookup,
+            model_id=args.model_id,
+            device=device,
+            batch_size=args.flip_aug_batch_size,
+        )
+        train_rows = [*train_rows, *flipped_rows]
 
-    datasets = {name: TransitionDataset(split_rows_) for name, split_rows_ in splits.items()}
+    datasets = {
+        "train": TransitionDataset(train_rows),
+        "val": TransitionDataset(splits["val"]),
+        "test": TransitionDataset(splits["test"]),
+    }
     loaders = {
         "train": DataLoader(datasets["train"], batch_size=args.batch_size, shuffle=True),
         "val": DataLoader(datasets["val"], batch_size=args.batch_size, shuffle=False),
@@ -244,26 +428,31 @@ def main() -> None:
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     best_state = None
-    best_val_cosine = -float("inf")
+    best_val_score = -float("inf")
     epochs_without_improvement = 0
     history: List[Dict[str, float]] = []
 
     val_centroids, val_bank, val_keys = build_eval_artifacts(splits["val"])
 
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_one_epoch(model, loaders["train"], optimizer, device)
+        train_metrics = train_one_epoch(model, loaders["train"], optimizer, device, args)
         val_metrics = evaluate(model, loaders["val"], device, val_centroids, val_bank, val_keys)
+        val_score = metric_value(val_metrics, args)
         epoch_summary = {
             "epoch": float(epoch),
-            "train_loss": train_loss,
+            "train_loss": train_metrics["loss"],
+            "train_cosine_loss": train_metrics["cosine_loss"],
+            "train_contrastive_loss": train_metrics["contrastive_loss"],
             "val_mean_target_cosine": val_metrics["mean_target_cosine"],
             "val_centroid_stage_accuracy": val_metrics["centroid_stage_accuracy"],
             "val_exact_target_retrieval_at_1": val_metrics["exact_target_retrieval_at_1"],
+            "val_exact_target_retrieval_at_5": val_metrics["exact_target_retrieval_at_5"],
+            "val_selection_score": val_score,
         }
         history.append(epoch_summary)
 
-        if val_metrics["mean_target_cosine"] > best_val_cosine:
-            best_val_cosine = val_metrics["mean_target_cosine"]
+        if val_score > best_val_score:
+            best_val_score = val_score
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             epochs_without_improvement = 0
         else:
@@ -294,11 +483,23 @@ def main() -> None:
             "dropout": args.dropout,
             "num_stages": max_stage_idx + 1,
         },
-        "num_train": len(splits["train"]),
+        "training_config": {
+            "horizontal_flip_augmentation": bool(args.horizontal_flip_augmentation),
+            "model_id": args.model_id,
+            "flip_aug_batch_size": args.flip_aug_batch_size,
+            "cosine_weight": args.cosine_weight,
+            "contrastive_weight": args.contrastive_weight,
+            "temperature": args.temperature,
+            "selection_metric": args.selection_metric,
+            "blend_retrieval_weight": args.blend_retrieval_weight,
+            "blend_cosine_weight": args.blend_cosine_weight,
+        },
+        "num_train": len(train_rows),
+        "num_train_base": len(splits["train"]),
         "num_val": len(splits["val"]),
         "num_test": len(splits["test"]),
         "embedding_dim": embedding_dim,
-        "best_val_mean_target_cosine": best_val_cosine,
+        "best_val_selection_score": best_val_score,
         "train_metrics": train_metrics,
         "val_metrics": final_val_metrics,
         "test_metrics": test_metrics,
@@ -308,11 +509,12 @@ def main() -> None:
     write_json(output_dir / "metrics.json", summary)
 
     print("Transition baseline training complete")
-    print(f"Train / Val / Test: {len(splits['train'])} / {len(splits['val'])} / {len(splits['test'])}")
-    print(f"Best val cosine:    {best_val_cosine:.4f}")
+    print(f"Train / Val / Test: {len(train_rows)} / {len(splits['val'])} / {len(splits['test'])}")
+    print(f"Best val score:     {best_val_score:.4f} ({args.selection_metric})")
     print(f"Test cosine:        {test_metrics['mean_target_cosine']:.4f}")
     print(f"Test stage acc:     {test_metrics['centroid_stage_accuracy']:.4f}")
     print(f"Test retrieval@1:   {test_metrics['exact_target_retrieval_at_1']:.4f}")
+    print(f"Test retrieval@5:   {test_metrics['exact_target_retrieval_at_5']:.4f}")
     print(f"Output dir:         {output_dir}")
 
 

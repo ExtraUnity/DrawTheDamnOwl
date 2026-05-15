@@ -9,11 +9,16 @@ from PIL import Image, ImageDraw, ImageOps
 
 from learning_utils import (
     TransitionMLP,
+    PixelDecoderUNet,
+    StructuralLayerUNet,
+    compose_white_layer,
     default_device,
     embed_image_with_clip,
-    load_checkpoint_state,
+    image_to_tensor,
     load_embedding_archive,
     load_model_config,
+    load_transition_mlp_checkpoint,
+    tensor_to_pil,
 )
 from script_utils import LEARNING_ROOT, ensure_dir, read_csv_rows, require_file, write_json
 
@@ -46,6 +51,44 @@ def parse_args() -> argparse.Namespace:
         default=str(LEARNING_ROOT / "inference"),
         help="Output directory for rollout artifacts",
     )
+    parser.add_argument(
+        "--render-mode",
+        choices=["retrieval", "pixel"],
+        default="retrieval",
+        help="Use nearest-neighbor retrieval or the trained pixel decoder for stage images",
+    )
+    parser.add_argument(
+        "--pixel-decoder-checkpoint",
+        default=str(LEARNING_ROOT / "pixel_decoder" / "best_pixel_decoder.pt"),
+        help="Path to trained pixel decoder checkpoint from train_pixel_decoder.py",
+    )
+    parser.add_argument(
+        "--structural-decoder-checkpoint",
+        default=str(LEARNING_ROOT / "structural_decoder" / "best_structural_decoder.pt"),
+        help="Path to trained structural layer decoder checkpoint",
+    )
+    parser.add_argument(
+        "--disable-structural-decoder",
+        action="store_true",
+        help="In pixel mode, skip structural layer decoder and use the pixel decoder for all stages",
+    )
+    parser.add_argument(
+        "--structural-until-stage",
+        type=int,
+        default=4,
+        help="Use structural decoder for predicted stages up to and including this stage",
+    )
+    parser.add_argument(
+        "--structural-threshold",
+        type=float,
+        default=None,
+        help="Override structural layer probability threshold from checkpoint",
+    )
+    parser.add_argument(
+        "--save-retrieval-fallback",
+        action="store_true",
+        help="In pixel mode, also save nearest retrieved stage images for side-by-side comparison",
+    )
     parser.add_argument("--model-id", default="openai/clip-vit-base-patch32", help="Hugging Face CLIP model id")
     parser.add_argument("--device", default=default_device(), help="Inference device")
     parser.add_argument("--start-stage", type=int, default=0, help="Stage index represented by the input sketch")
@@ -65,6 +108,50 @@ def parse_args() -> argparse.Namespace:
         "--use-retrieved-embedding",
         action="store_true",
         help="Snap each step to the retrieved embedding before predicting the next stage",
+    )
+    parser.add_argument("--retrieval-topk", type=int, default=5, help="Number of nearest candidates to consider before reranking")
+    parser.add_argument("--retrieval-beam-width", type=int, default=3, help="Beam width for rollout-time retrieval reranking")
+    parser.add_argument(
+        "--retrieval-consistency-weight",
+        type=float,
+        default=0.15,
+        help="Weight for consistency with the previously selected retrieved embedding",
+    )
+    parser.add_argument(
+        "--retrieval-anchor-weight",
+        type=float,
+        default=0.05,
+        help="Weight for consistency with the original input embedding",
+    )
+    parser.add_argument(
+        "--early-retrieval-max-stage",
+        type=int,
+        default=3,
+        help="Predicted stages up to and including this index use the early-stage retrieval reranker settings",
+    )
+    parser.add_argument(
+        "--early-retrieval-topk",
+        type=int,
+        default=10,
+        help="Top-k candidate pool to use for early-stage retrieval reranking",
+    )
+    parser.add_argument(
+        "--early-retrieval-consistency-multiplier",
+        type=float,
+        default=2.0,
+        help="Multiplier on retrieval consistency weight for early stages",
+    )
+    parser.add_argument(
+        "--early-retrieval-anchor-multiplier",
+        type=float,
+        default=3.0,
+        help="Multiplier on retrieval anchor weight for early stages",
+    )
+    parser.add_argument(
+        "--early-retrieval-source-weight",
+        type=float,
+        default=0.15,
+        help="Extra weight on similarity to the current source embedding during early-stage reranking",
     )
     return parser.parse_args()
 
@@ -123,6 +210,85 @@ def retrieve_nearest(query_embedding: np.ndarray, stage_bank: Dict[str, object])
     return record
 
 
+def retrieve_topk(query_embedding: np.ndarray, stage_bank: Dict[str, object], top_k: int) -> List[Dict[str, object]]:
+    bank = np.asarray(stage_bank["embeddings"], dtype=np.float32)
+    scores = bank @ query_embedding
+    k = max(1, min(int(top_k), int(scores.shape[0])))
+    if k == scores.shape[0]:
+        top_idx = np.argsort(scores)[::-1]
+    else:
+        top_idx = np.argpartition(scores, -k)[-k:]
+        top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
+
+    out: List[Dict[str, object]] = []
+    for rank, idx in enumerate(top_idx, start=1):
+        record = dict(stage_bank["records"][int(idx)])
+        record["cosine"] = float(scores[int(idx)])
+        record["embedding"] = bank[int(idx)]
+        record["retrieval_rank"] = int(rank)
+        out.append(record)
+    return out
+
+
+def retrieval_topk_for_stage(predicted_stage: int, retrieval_topk: int, early_retrieval_max_stage: int, early_retrieval_topk: int) -> int:
+    if int(predicted_stage) <= int(early_retrieval_max_stage):
+        return max(int(retrieval_topk), int(early_retrieval_topk))
+    return int(retrieval_topk)
+
+
+def retrieval_rerank_weights(
+    predicted_stage: int,
+    consistency_weight: float,
+    anchor_weight: float,
+    early_retrieval_max_stage: int,
+    early_retrieval_consistency_multiplier: float,
+    early_retrieval_anchor_multiplier: float,
+    early_retrieval_source_weight: float,
+) -> Tuple[float, float, float]:
+    if int(predicted_stage) <= int(early_retrieval_max_stage):
+        return (
+            float(consistency_weight) * float(early_retrieval_consistency_multiplier),
+            float(anchor_weight) * float(early_retrieval_anchor_multiplier),
+            float(early_retrieval_source_weight),
+        )
+    return float(consistency_weight), float(anchor_weight), 0.0
+
+
+def rerank_candidate(
+    candidate: Dict[str, object],
+    query_embedding: np.ndarray,
+    source_embedding: np.ndarray,
+    prev_retrieved_embedding: np.ndarray | None,
+    anchor_embedding: np.ndarray,
+    consistency_weight: float,
+    anchor_weight: float,
+    source_weight: float,
+) -> Dict[str, object]:
+    candidate_embedding = np.asarray(candidate["embedding"], dtype=np.float32)
+    query_score = float(candidate_embedding @ query_embedding)
+    source_score = float(candidate_embedding @ source_embedding)
+    consistency_score = (
+        float(candidate_embedding @ prev_retrieved_embedding)
+        if prev_retrieved_embedding is not None
+        else 0.0
+    )
+    anchor_score = float(candidate_embedding @ anchor_embedding)
+    rerank_score = (
+        query_score
+        + float(source_weight) * source_score
+        + float(consistency_weight) * consistency_score
+        + float(anchor_weight) * anchor_score
+    )
+
+    out = dict(candidate)
+    out["query_score"] = query_score
+    out["source_score"] = source_score
+    out["consistency_score"] = consistency_score
+    out["anchor_score"] = anchor_score
+    out["rerank_score"] = rerank_score
+    return out
+
+
 def build_contact_sheet(input_image: Path, rollout: List[Dict[str, object]], output_path: Path) -> None:
     tile_size = 256
     label_height = 28
@@ -134,7 +300,14 @@ def build_contact_sheet(input_image: Path, rollout: List[Dict[str, object]], out
     labels.append("input")
 
     for step in rollout:
-        with Image.open(step["retrieved_image_path"]) as image:
+        image_path = (
+            step.get("copied_image_path")
+            or step.get("retrieved_image_path")
+            or step.get("generated_image_path")
+        )
+        if not image_path:
+            continue
+        with Image.open(image_path) as image:
             images.append(ImageOps.contain(image.convert("RGB"), (tile_size, tile_size)))
         labels.append(f"stage {step['predicted_stage']}")
 
@@ -182,45 +355,306 @@ def build_stage_chain(start_stage: int, end_stage: int, num_stages: int, stage_b
 def rollout_stages(
     model: TransitionMLP,
     current_embedding: np.ndarray,
+    anchor_embedding: np.ndarray,
     stage_bank: Dict[int, Dict[str, object]],
     stage_chain: List[int],
     output_dir: Path,
     device: torch.device,
     use_retrieved_embedding: bool,
+    retrieval_topk: int,
+    retrieval_beam_width: int,
+    retrieval_consistency_weight: float,
+    retrieval_anchor_weight: float,
+    early_retrieval_max_stage: int,
+    early_retrieval_topk: int,
+    early_retrieval_consistency_multiplier: float,
+    early_retrieval_anchor_multiplier: float,
+    early_retrieval_source_weight: float,
 ) -> List[Dict[str, object]]:
-    rollout: List[Dict[str, object]] = []
+    beam_width = max(1, int(retrieval_beam_width))
+    beam: List[Dict[str, object]] = [
+        {
+            "model_embedding": np.asarray(current_embedding, dtype=np.float32),
+            "prev_retrieved_embedding": None,
+            "score": 0.0,
+            "steps": [],
+        }
+    ]
 
     for src_stage, predicted_stage in zip(stage_chain[:-1], stage_chain[1:]):
-        src_tensor = torch.from_numpy(current_embedding).unsqueeze(0).to(device)
-        src_stage_tensor = torch.tensor([src_stage], dtype=torch.long, device=device)
+        stage_topk = retrieval_topk_for_stage(
+            predicted_stage,
+            retrieval_topk,
+            early_retrieval_max_stage,
+            early_retrieval_topk,
+        )
+        stage_consistency_weight, stage_anchor_weight, stage_source_weight = retrieval_rerank_weights(
+            predicted_stage,
+            retrieval_consistency_weight,
+            retrieval_anchor_weight,
+            early_retrieval_max_stage,
+            early_retrieval_consistency_multiplier,
+            early_retrieval_anchor_multiplier,
+            early_retrieval_source_weight,
+        )
+        next_beam: List[Dict[str, object]] = []
 
-        with torch.no_grad():
-            pred = model(src_tensor, src_stage_tensor)[0].detach().cpu().numpy().astype(np.float32)
+        for state in beam:
+            source_embedding = np.asarray(state["model_embedding"], dtype=np.float32)
+            src_tensor = torch.from_numpy(source_embedding).unsqueeze(0).to(device)
+            src_stage_tensor = torch.tensor([src_stage], dtype=torch.long, device=device)
 
-        pred /= max(float(np.linalg.norm(pred)), 1e-12)
+            with torch.no_grad():
+                pred = model(src_tensor, src_stage_tensor)[0].detach().cpu().numpy().astype(np.float32)
 
-        match = retrieve_nearest(pred, stage_bank[predicted_stage])
-        retrieved_path = Path(match["image_path"])
+            pred /= max(float(np.linalg.norm(pred)), 1e-12)
+            candidates = retrieve_topk(pred, stage_bank[predicted_stage], stage_topk)
+            if not candidates:
+                raise RuntimeError(f"No retrieval candidates available for stage {predicted_stage}")
+
+            scored = [
+                rerank_candidate(
+                    candidate=candidate,
+                    query_embedding=pred,
+                    source_embedding=source_embedding,
+                    prev_retrieved_embedding=state["prev_retrieved_embedding"],
+                    anchor_embedding=anchor_embedding,
+                    consistency_weight=stage_consistency_weight,
+                    anchor_weight=stage_anchor_weight,
+                    source_weight=stage_source_weight,
+                )
+                for candidate in candidates
+            ]
+            scored.sort(key=lambda item: float(item["rerank_score"]), reverse=True)
+
+            for candidate in scored[:beam_width]:
+                next_embedding = np.asarray(candidate["embedding"] if use_retrieved_embedding else pred, dtype=np.float32)
+                step = {
+                    "source_stage": src_stage,
+                    "predicted_stage": predicted_stage,
+                    "retrieved_frame_key": candidate["frame_key"],
+                    "retrieved_stem": candidate["stem"],
+                    "retrieved_split": candidate["split"],
+                    "retrieved_image_path": str(candidate["image_path"]),
+                    "retrieval_rank": int(candidate["retrieval_rank"]),
+                    "retrieval_cosine": float(candidate["cosine"]),
+                    "query_score": float(candidate["query_score"]),
+                    "source_score": float(candidate["source_score"]),
+                    "consistency_score": float(candidate["consistency_score"]),
+                    "anchor_score": float(candidate["anchor_score"]),
+                    "rerank_score": float(candidate["rerank_score"]),
+                    "rerank_topk": int(stage_topk),
+                    "rerank_consistency_weight": float(stage_consistency_weight),
+                    "rerank_anchor_weight": float(stage_anchor_weight),
+                    "rerank_source_weight": float(stage_source_weight),
+                }
+                next_beam.append(
+                    {
+                        "model_embedding": next_embedding,
+                        "prev_retrieved_embedding": np.asarray(candidate["embedding"], dtype=np.float32),
+                        "score": float(state["score"]) + float(candidate["rerank_score"]),
+                        "steps": [*state["steps"], step],
+                    }
+                )
+
+        if not next_beam:
+            raise RuntimeError(f"Rollout beam collapsed at stage {predicted_stage}")
+        next_beam.sort(key=lambda item: float(item["score"]), reverse=True)
+        beam = next_beam[:beam_width]
+
+    best_steps = list(beam[0]["steps"])
+    rollout: List[Dict[str, object]] = []
+    for step in best_steps:
+        retrieved_path = Path(step["retrieved_image_path"])
         require_file(retrieved_path, "Retrieved image")
-
-        copied_name = f"stage_{predicted_stage:02d}_{match['frame_key']}{retrieved_path.suffix}"
+        copied_name = f"stage_{int(step['predicted_stage']):02d}_{step['retrieved_frame_key']}{retrieved_path.suffix}"
         copied_path = output_dir / copied_name
         shutil.copy2(retrieved_path, copied_path)
+        step_out = dict(step)
+        step_out["copied_image_path"] = str(copied_path)
+        rollout.append(step_out)
 
-        rollout.append(
-            {
-                "source_stage": src_stage,
-                "predicted_stage": predicted_stage,
-                "retrieved_frame_key": match["frame_key"],
-                "retrieved_stem": match["stem"],
-                "retrieved_split": match["split"],
-                "retrieved_image_path": str(retrieved_path),
-                "copied_image_path": str(copied_path),
-                "retrieval_cosine": float(match["cosine"]),
-            }
-        )
+    return rollout
 
-        current_embedding = np.asarray(match["embedding"] if use_retrieved_embedding else pred, dtype=np.float32)
+
+def load_pixel_decoder(checkpoint_path: Path, device: torch.device) -> Tuple[PixelDecoderUNet, Dict[str, object]]:
+    require_file(checkpoint_path, "Pixel decoder checkpoint")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if not isinstance(checkpoint, dict) or "model_config" not in checkpoint:
+        raise RuntimeError(f"Pixel decoder checkpoint is missing model_config: {checkpoint_path}")
+
+    config = dict(checkpoint["model_config"])
+    model = PixelDecoderUNet(
+        embedding_dim=int(config["embedding_dim"]),
+        num_stages=int(config["num_stages"]),
+        base_channels=int(config.get("base_channels", 32)),
+        stage_embed_dim=int(config.get("stage_embed_dim", 16)),
+        cond_dim=int(config.get("cond_dim", 256)),
+        output_mode=str(config.get("output_mode", "direct")),
+        residual_scale=float(config.get("residual_scale", 1.0)),
+    ).to(device)
+
+    state = checkpoint.get("model_state_dict", checkpoint)
+    model.load_state_dict(state)
+    model.eval()
+    return model, config
+
+
+def load_structural_decoder(checkpoint_path: Path, device: torch.device) -> Tuple[StructuralLayerUNet, Dict[str, object]]:
+    require_file(checkpoint_path, "Structural decoder checkpoint")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if not isinstance(checkpoint, dict) or "model_config" not in checkpoint:
+        raise RuntimeError(f"Structural decoder checkpoint is missing model_config: {checkpoint_path}")
+
+    config = dict(checkpoint["model_config"])
+    model = StructuralLayerUNet(
+        num_stages=int(config["num_stages"]),
+        base_channels=int(config.get("base_channels", 32)),
+        stage_embed_dim=int(config.get("stage_embed_dim", 16)),
+        cond_dim=int(config.get("cond_dim", 128)),
+    ).to(device)
+
+    state = checkpoint.get("model_state_dict", checkpoint)
+    model.load_state_dict(state)
+    model.eval()
+    return model, config
+
+
+def rollout_stages_with_pixel_decoder(
+    model: TransitionMLP,
+    pixel_decoder: PixelDecoderUNet,
+    structural_decoder: StructuralLayerUNet | None,
+    current_embedding: np.ndarray,
+    anchor_embedding: np.ndarray,
+    input_image: Path,
+    stage_bank: Dict[int, Dict[str, object]],
+    start_stage: int,
+    end_stage: int,
+    output_dir: Path,
+    device: torch.device,
+    image_size: int,
+    save_retrieval_fallback: bool,
+    use_retrieved_embedding: bool,
+    structural_until_stage: int,
+    structural_threshold: float,
+    retrieval_topk: int,
+    retrieval_consistency_weight: float,
+    retrieval_anchor_weight: float,
+    early_retrieval_max_stage: int,
+    early_retrieval_topk: int,
+    early_retrieval_consistency_multiplier: float,
+    early_retrieval_anchor_multiplier: float,
+    early_retrieval_source_weight: float,
+) -> List[Dict[str, object]]:
+    rollout: List[Dict[str, object]] = []
+    prev_retrieved_embedding: np.ndarray | None = None
+
+    with Image.open(input_image) as image:
+        current_image = image_to_tensor(image, image_size).to(device)
+
+    for src_stage in range(start_stage, end_stage):
+        src_tensor = torch.from_numpy(current_embedding).unsqueeze(0).to(device)
+        src_stage_tensor = torch.tensor([src_stage], dtype=torch.long, device=device)
+        predicted_stage = src_stage + 1
+
+        with torch.no_grad():
+            pred = model(src_tensor, src_stage_tensor)
+            pred_np = pred[0].detach().cpu().numpy().astype(np.float32)
+            pred_np /= max(float(np.linalg.norm(pred_np)), 1e-12)
+            if structural_decoder is not None and predicted_stage <= structural_until_stage:
+                layer_probs = torch.sigmoid(structural_decoder(current_image.unsqueeze(0), src_stage_tensor))
+                layer = (layer_probs >= structural_threshold).to(dtype=torch.float32)
+                generated = compose_white_layer(current_image.unsqueeze(0), layer)[0]
+                layer_path = output_dir / f"stage_{predicted_stage:02d}_structural_layer.png"
+                tensor_to_pil(layer[0].repeat(3, 1, 1)).save(layer_path)
+                generator_name = "structural"
+            else:
+                generated = pixel_decoder(current_image.unsqueeze(0), pred, src_stage_tensor)[0]
+                layer_path = None
+                generator_name = "dense_pixel"
+
+        generated_path = output_dir / f"stage_{predicted_stage:02d}_generated.png"
+        tensor_to_pil(generated).save(generated_path)
+
+        step: Dict[str, object] = {
+            "source_stage": src_stage,
+            "predicted_stage": predicted_stage,
+            "generator": generator_name,
+            "generated_image_path": str(generated_path),
+        }
+        if layer_path is not None:
+            step["generated_layer_path"] = str(layer_path)
+
+        match = None
+        if save_retrieval_fallback or use_retrieved_embedding:
+            stage_topk = retrieval_topk_for_stage(
+                predicted_stage,
+                retrieval_topk,
+                early_retrieval_max_stage,
+                early_retrieval_topk,
+            )
+            stage_consistency_weight, stage_anchor_weight, stage_source_weight = retrieval_rerank_weights(
+                predicted_stage,
+                retrieval_consistency_weight,
+                retrieval_anchor_weight,
+                early_retrieval_max_stage,
+                early_retrieval_consistency_multiplier,
+                early_retrieval_anchor_multiplier,
+                early_retrieval_source_weight,
+            )
+            candidates = retrieve_topk(pred_np, stage_bank[predicted_stage], stage_topk)
+            if not candidates:
+                raise RuntimeError(f"No retrieval candidates available for stage {predicted_stage}")
+            scored = [
+                rerank_candidate(
+                    candidate=candidate,
+                    query_embedding=pred_np,
+                    source_embedding=current_embedding,
+                    prev_retrieved_embedding=prev_retrieved_embedding,
+                    anchor_embedding=anchor_embedding,
+                    consistency_weight=stage_consistency_weight,
+                    anchor_weight=stage_anchor_weight,
+                    source_weight=stage_source_weight,
+                )
+                for candidate in candidates
+            ]
+            scored.sort(key=lambda item: float(item["rerank_score"]), reverse=True)
+            match = scored[0]
+            step.update(
+                {
+                    "retrieved_frame_key": match["frame_key"],
+                    "retrieved_stem": match["stem"],
+                    "retrieved_split": match["split"],
+                    "retrieval_rank": int(match["retrieval_rank"]),
+                    "retrieval_cosine": float(match["cosine"]),
+                    "query_score": float(match["query_score"]),
+                    "source_score": float(match["source_score"]),
+                    "consistency_score": float(match["consistency_score"]),
+                    "anchor_score": float(match["anchor_score"]),
+                    "rerank_score": float(match["rerank_score"]),
+                    "rerank_topk": int(stage_topk),
+                    "rerank_consistency_weight": float(stage_consistency_weight),
+                    "rerank_anchor_weight": float(stage_anchor_weight),
+                    "rerank_source_weight": float(stage_source_weight),
+                }
+            )
+            if save_retrieval_fallback:
+                retrieved_path = Path(match["image_path"])
+                require_file(retrieved_path, "Retrieved image")
+                copied_name = f"stage_{predicted_stage:02d}_retrieval_{match['frame_key']}{retrieved_path.suffix}"
+                copied_path = output_dir / copied_name
+                shutil.copy2(retrieved_path, copied_path)
+                step.update(
+                    {
+                        "retrieved_image_path": str(retrieved_path),
+                        "copied_image_path": str(copied_path),
+                    }
+                )
+
+        rollout.append(step)
+        current_embedding = np.asarray(match["embedding"] if use_retrieved_embedding and match is not None else pred_np, dtype=np.float32)
+        prev_retrieved_embedding = np.asarray(match["embedding"], dtype=np.float32) if match is not None else prev_retrieved_embedding
+        current_image = generated.detach()
 
     return rollout
 
@@ -247,20 +681,79 @@ def main() -> None:
         num_stages=int(model_config["num_stages"]),
     ).to(device)
 
-    state_dict = load_checkpoint_state(checkpoint, device)
-    model.load_state_dict(state_dict)
+    load_transition_mlp_checkpoint(model, checkpoint, device)
     model.eval()
 
     current_embedding = embed_image_with_clip(input_image, args.model_id, device)
-    rollout = rollout_stages(
-        model=model,
-        current_embedding=current_embedding,
-        stage_bank=stage_bank,
-        stage_chain=stage_chain,
-        output_dir=output_dir,
-        device=device,
-        use_retrieved_embedding=args.use_retrieved_embedding,
-    )
+    anchor_embedding = np.asarray(current_embedding, dtype=np.float32).copy()
+    structural_threshold = 0.5
+
+    if args.render_mode == "retrieval":
+        rollout = rollout_stages(
+            model=model,
+            current_embedding=current_embedding,
+            anchor_embedding=anchor_embedding,
+            stage_bank=stage_bank,
+            stage_chain=stage_chain,
+            output_dir=output_dir,
+            device=device,
+            use_retrieved_embedding=args.use_retrieved_embedding,
+            retrieval_topk=args.retrieval_topk,
+            retrieval_beam_width=args.retrieval_beam_width,
+            retrieval_consistency_weight=args.retrieval_consistency_weight,
+            retrieval_anchor_weight=args.retrieval_anchor_weight,
+            early_retrieval_max_stage=args.early_retrieval_max_stage,
+            early_retrieval_topk=args.early_retrieval_topk,
+            early_retrieval_consistency_multiplier=args.early_retrieval_consistency_multiplier,
+            early_retrieval_anchor_multiplier=args.early_retrieval_anchor_multiplier,
+            early_retrieval_source_weight=args.early_retrieval_source_weight,
+        )
+    else:
+        pixel_decoder, pixel_config = load_pixel_decoder(Path(args.pixel_decoder_checkpoint), device)
+        image_size = int(pixel_config.get("image_size", 256))
+        structural_decoder = None
+        if not args.disable_structural_decoder:
+            structural_decoder, structural_config = load_structural_decoder(Path(args.structural_decoder_checkpoint), device)
+            structural_image_size = int(structural_config.get("image_size", image_size))
+            if structural_image_size != image_size:
+                raise RuntimeError(
+                    "Pixel and structural decoder checkpoints disagree on image_size: "
+                    f"{image_size} vs {structural_image_size}"
+                )
+            structural_threshold = (
+                float(args.structural_threshold)
+                if args.structural_threshold is not None
+                else float(structural_config.get("threshold", 0.5))
+            )
+        elif args.structural_threshold is not None:
+            structural_threshold = float(args.structural_threshold)
+
+        rollout = rollout_stages_with_pixel_decoder(
+            model=model,
+            pixel_decoder=pixel_decoder,
+            structural_decoder=structural_decoder,
+            current_embedding=current_embedding,
+            anchor_embedding=anchor_embedding,
+            input_image=input_image,
+            stage_bank=stage_bank,
+            start_stage=stage_chain[0],
+            end_stage=stage_chain[-1],
+            output_dir=output_dir,
+            device=device,
+            image_size=image_size,
+            save_retrieval_fallback=args.save_retrieval_fallback,
+            use_retrieved_embedding=args.use_retrieved_embedding,
+            structural_until_stage=args.structural_until_stage,
+            structural_threshold=structural_threshold,
+            retrieval_topk=args.retrieval_topk,
+            retrieval_consistency_weight=args.retrieval_consistency_weight,
+            retrieval_anchor_weight=args.retrieval_anchor_weight,
+            early_retrieval_max_stage=args.early_retrieval_max_stage,
+            early_retrieval_topk=args.early_retrieval_topk,
+            early_retrieval_consistency_multiplier=args.early_retrieval_consistency_multiplier,
+            early_retrieval_anchor_multiplier=args.early_retrieval_anchor_multiplier,
+            early_retrieval_source_weight=args.early_retrieval_source_weight,
+        )
 
     resolved_end_stage = stage_chain[-1]
 
@@ -269,10 +762,23 @@ def main() -> None:
         "checkpoint": str(checkpoint),
         "model_id": args.model_id,
         "device": str(device),
+        "render_mode": args.render_mode,
         "start_stage": args.start_stage,
         "end_stage": resolved_end_stage,
         "stage_chain": stage_chain,
         "retrieval_split": args.retrieval_split,
+        "retrieval_topk": args.retrieval_topk,
+        "retrieval_beam_width": args.retrieval_beam_width,
+        "retrieval_consistency_weight": args.retrieval_consistency_weight,
+        "retrieval_anchor_weight": args.retrieval_anchor_weight,
+        "early_retrieval_max_stage": args.early_retrieval_max_stage,
+        "early_retrieval_topk": args.early_retrieval_topk,
+        "early_retrieval_consistency_multiplier": args.early_retrieval_consistency_multiplier,
+        "early_retrieval_anchor_multiplier": args.early_retrieval_anchor_multiplier,
+        "early_retrieval_source_weight": args.early_retrieval_source_weight,
+        "save_retrieval_fallback": bool(args.save_retrieval_fallback),
+        "structural_until_stage": int(args.structural_until_stage),
+        "structural_threshold": float(structural_threshold),
         "use_retrieved_embedding": bool(args.use_retrieved_embedding),
         "rollout": rollout,
     }

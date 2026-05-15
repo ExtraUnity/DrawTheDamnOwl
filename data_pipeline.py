@@ -13,6 +13,8 @@ from owl_pipeline_stages import (
     stage_04_inner_contours,
     stage_05_value_regions,
     stage_07_fine_texture,
+    stage_08_color,
+    stage_09_background,
 )
 from owl_pipeline_utils import (
     CANVAS_SIZE,
@@ -31,7 +33,7 @@ from owl_pipeline_utils import (
 
 
 # Carryover policy controls.
-EXCLUDE_STAGE_02_03_FROM_LATER = True
+USE_STABLE_BASELINE_FOR_LATER = True
 EXCLUDE_STAGE_00_FROM_LATER = True
 EXCLUDE_STAGE_01_FROM_STAGE5_ONWARD = True
 EXCLUDE_STAGE_04_FROM_STAGE7_ONWARD = True
@@ -45,6 +47,8 @@ STAGE_ACTION = {
     3: "add_inner_contours",
     4: "add_value_regions",
     5: "add_fine_texture",
+    6: "add_color",
+    7: "add_background",
 }
 
 
@@ -133,6 +137,16 @@ class OwlStagedPipeline:
             self._write_stage_outputs(stem, stage_idx, layer, cumulative, meta)
             return cumulative, prev_color
 
+        if stage_idx == 6:
+            layer, cumulative, meta = stage_08_color(image, mask, prev_gray)
+            self._write_stage_outputs(stem, stage_idx, layer, cumulative, meta)
+            return prev_gray, cumulative
+
+        if stage_idx == 7:
+            layer, cumulative, meta = stage_09_background(image, mask, prev_color)
+            self._write_stage_outputs(stem, stage_idx, layer, cumulative, meta)
+            return prev_gray, cumulative
+
         raise ValueError(f"Unsupported stage index: {stage_idx}")
 
     def _restore_skip_state(
@@ -145,9 +159,9 @@ class OwlStagedPipeline:
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
         stage_out = stage_cumulative_path(self.output_root, stem, stage_idx)
 
-        if stage_idx <= 7:
+        if stage_idx <= 5:
             prev_gray = cv2.imread(stage_out, cv2.IMREAD_GRAYSCALE)
-            if stage_idx == 1 or (EXCLUDE_STAGE_02_03_FROM_LATER and 4 <= stage_idx <= 7):
+            if stage_idx == 1 or (USE_STABLE_BASELINE_FOR_LATER and 3 <= stage_idx <= 5):
                 if stage_idx == 1 and EXCLUDE_STAGE_00_FROM_LATER:
                     prev_gray_clean_later = cv2.imread(stage_layer_path(self.output_root, stem, 1), cv2.IMREAD_GRAYSCALE)
                 else:
@@ -164,9 +178,9 @@ class OwlStagedPipeline:
         prev_gray: Optional[np.ndarray],
         prev_color: Optional[np.ndarray],
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        if stage_idx > 0 and prev_gray is None and stage_idx <= 5:
+        if stage_idx > 0 and prev_gray is None and stage_idx <= 6:
             prev_gray = load_previous_stage_if_present(self.output_root, stem, stage_idx, grayscale=True)
-        if stage_idx > 8 and prev_color is None:
+        if stage_idx > 6 and prev_color is None:
             prev_color = load_previous_stage_if_present(self.output_root, stem, stage_idx, grayscale=False)
         return prev_gray, prev_color
 
@@ -177,11 +191,11 @@ class OwlStagedPipeline:
         prev_gray: Optional[np.ndarray],
         prev_color: Optional[np.ndarray],
     ) -> bool:
-        if stage_idx > 0 and stage_idx < 4 and prev_gray is None:
+        if stage_idx in (1, 2) and prev_gray is None:
             print(f"[ERROR] {stem} stage {stage_idx:02d}: missing previous grayscale cumulative stage")
             return False
-        if stage_idx == 9 and prev_color is None:
-            print(f"[ERROR] {stem} stage 09: missing stage 08 color cumulative image")
+        if stage_idx == 7 and prev_color is None:
+            print(f"[ERROR] {stem} stage 07: missing stage 06 color cumulative image")
             return False
         return True
 
@@ -194,7 +208,7 @@ class OwlStagedPipeline:
         if prev_gray_clean_later is not None:
             return prev_gray_clean_later
 
-        if stage_idx >= 5:
+        if stage_idx >= 4:
             prev_chain_path = stage_cumulative_path(self.output_root, stem, stage_idx - 1)
             if os.path.isfile(prev_chain_path):
                 return cv2.imread(prev_chain_path, cv2.IMREAD_GRAYSCALE)
@@ -216,7 +230,7 @@ class OwlStagedPipeline:
         stage_prev_gray: Optional[np.ndarray],
         stage01_layer_cache: Optional[np.ndarray],
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        if not (EXCLUDE_STAGE_01_FROM_STAGE5_ONWARD and stage_idx >= 4 and stage_prev_gray is not None):
+        if not (EXCLUDE_STAGE_01_FROM_STAGE5_ONWARD and 4 <= stage_idx <= 6 and stage_prev_gray is not None):
             return stage_prev_gray, stage01_layer_cache
 
         if stage01_layer_cache is None:
@@ -237,7 +251,7 @@ class OwlStagedPipeline:
         stage_prev_gray: Optional[np.ndarray],
         stage04_layer_cache: Optional[np.ndarray],
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        if not (EXCLUDE_STAGE_04_FROM_STAGE7_ONWARD and stage_idx >= 5 and stage_prev_gray is not None):
+        if not (EXCLUDE_STAGE_04_FROM_STAGE7_ONWARD and 5 <= stage_idx <= 6 and stage_prev_gray is not None):
             return stage_prev_gray, stage04_layer_cache
 
         if stage04_layer_cache is None:
@@ -253,7 +267,7 @@ class OwlStagedPipeline:
         return stage_prev_gray, stage04_layer_cache
 
     def _apply_edge_band_suppression(self, stage_idx: int, stage_prev_gray: Optional[np.ndarray], mask: np.ndarray) -> Optional[np.ndarray]:
-        if not (SUPPRESS_EDGE_BAND_FROM_STAGE6_ONWARD and stage_idx >= 6 and stage_prev_gray is not None):
+        if not (SUPPRESS_EDGE_BAND_FROM_STAGE6_ONWARD and 5 <= stage_idx <= 6 and stage_prev_gray is not None):
             return stage_prev_gray
 
         stage_prev_gray = stage_prev_gray.copy()
@@ -275,7 +289,7 @@ class OwlStagedPipeline:
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
         stage_prev_gray = prev_gray
 
-        if EXCLUDE_STAGE_02_03_FROM_LATER and 3 <= stage_idx <= 5:
+        if USE_STABLE_BASELINE_FOR_LATER and 3 <= stage_idx <= 6:
             clean_baseline = self._baseline_for_later_stages(stem, stage_idx, prev_gray_clean_later)
             if clean_baseline is None:
                 return None, prev_gray_clean_later, stage01_layer_cache, stage04_layer_cache
@@ -311,7 +325,7 @@ class OwlStagedPipeline:
         if stage_idx == 3:
             stage04_layer_cache = cv2.imread(stage_layer_path(self.output_root, stem, 3), cv2.IMREAD_GRAYSCALE)
 
-        if EXCLUDE_STAGE_02_03_FROM_LATER and 3 <= stage_idx <= 5:
+        if USE_STABLE_BASELINE_FOR_LATER and 3 <= stage_idx <= 5:
             prev_gray_clean_later = prev_gray.copy() if prev_gray is not None else None
 
         return prev_gray_clean_later, stage01_layer_cache, stage04_layer_cache
@@ -352,8 +366,8 @@ class OwlStagedPipeline:
                 mask,
             )
 
-            if EXCLUDE_STAGE_02_03_FROM_LATER and 4 <= stage_idx <= 8 and stage_prev_gray is None:
-                print(f"[ERROR] {stem} stage {stage_idx:02d}: missing clean baseline (stage 01 layer/cumulative) for later stages")
+            if USE_STABLE_BASELINE_FOR_LATER and 3 <= stage_idx <= 6 and stage_prev_gray is None:
+                print(f"[ERROR] {stem} stage {stage_idx:02d}: missing clean baseline (stage 01 layer/cumulative) for stages that exclude stage 02 carryover")
                 return False
 
             try:

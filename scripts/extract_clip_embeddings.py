@@ -6,7 +6,12 @@ import numpy as np
 import torch
 from PIL import Image
 
-from learning_utils import default_device, extract_clip_image_features, load_clip
+from learning_utils import (
+    combine_stage_features,
+    default_device,
+    extract_clip_image_features,
+    load_clip,
+)
 from script_utils import LEARNING_ROOT, ensure_dir, read_csv_rows, write_json
 
 
@@ -50,10 +55,11 @@ def batch_iter(items: List[Dict[str, str]], batch_size: int):
         yield items[i : i + batch_size]
 
 
-def load_images(batch: List[Dict[str, str]]) -> List[Image.Image]:
+def load_images(batch: List[Dict[str, str]], key: str) -> List[Image.Image]:
     images: List[Image.Image] = []
     for row in batch:
-        image_path = Path(row["image_path"])
+        image_path_str = row.get(key) or row["image_path"]
+        image_path = Path(image_path_str)
         if not image_path.exists():
             raise FileNotFoundError(f"Missing image file: {image_path}")
         with Image.open(image_path) as image:
@@ -78,23 +84,36 @@ def main() -> None:
     stems: List[str] = []
     stage_indices: List[int] = []
     image_paths: List[str] = []
+    layer_paths: List[str] = []
     splits: List[str] = []
 
     with torch.no_grad():
         for batch in batch_iter(rows, args.batch_size):
-            images = load_images(batch)
-            inputs = processor(images=images, return_tensors="pt", padding=True)
-            inputs = {k: v.to(device) for k, v in inputs.items()}
+            images = load_images(batch, "image_path")
+            image_inputs = processor(images=images, return_tensors="pt", padding=True)
+            image_inputs = {k: v.to(device) for k, v in image_inputs.items()}
+            image_features = extract_clip_image_features(model, image_inputs)
+            image_features = image_features.detach().cpu().numpy().astype(np.float32)
 
-            features = extract_clip_image_features(model, inputs)
-            if not args.no_normalize:
-                features = torch.nn.functional.normalize(features, p=2, dim=-1)
-            all_features.append(features.detach().cpu().numpy().astype(np.float32))
+            layer_images = load_images(batch, "layer_path")
+            layer_inputs = processor(images=layer_images, return_tensors="pt", padding=True)
+            layer_inputs = {k: v.to(device) for k, v in layer_inputs.items()}
+            layer_features = extract_clip_image_features(model, layer_inputs)
+            layer_features = layer_features.detach().cpu().numpy().astype(np.float32)
+
+            batch_features = []
+            for image_feature, layer_feature in zip(image_features, layer_features):
+                combined = combine_stage_features(image_feature, layer_feature)
+                if not args.no_normalize:
+                    combined /= max(float(np.linalg.norm(combined)), 1e-12)
+                batch_features.append(combined)
+            all_features.append(np.stack(batch_features, axis=0).astype(np.float32))
 
             for row in batch:
                 stems.append(row["stem"])
                 stage_indices.append(int(row["stage_idx"]))
                 image_paths.append(row["image_path"])
+                layer_paths.append(row.get("layer_path", ""))
                 splits.append(row["split"])
 
     embeddings = np.concatenate(all_features, axis=0)
@@ -104,6 +123,7 @@ def main() -> None:
     stem_arr = np.array(stems, dtype=object)
     stage_arr = np.array(stage_indices, dtype=np.int16)
     path_arr = np.array(image_paths, dtype=object)
+    layer_arr = np.array(layer_paths, dtype=object)
     split_arr = np.array(splits, dtype=object)
 
     split_tag = args.split
@@ -114,6 +134,7 @@ def main() -> None:
         stems=stem_arr,
         stage_indices=stage_arr,
         image_paths=path_arr,
+        layer_paths=layer_arr,
         splits=split_arr,
     )
 
@@ -121,6 +142,8 @@ def main() -> None:
         "model_id": args.model_id,
         "device": str(device),
         "normalize": not args.no_normalize,
+        "feature_views": ["image_path", "layer_path"],
+        "feature_weighting": "equal_image_layer",
         "manifest_frames": str(manifest_path),
         "split": args.split,
         "num_samples": int(embeddings.shape[0]),

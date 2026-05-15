@@ -18,9 +18,11 @@ The pipeline writes active stage folders and JSON annotations:
 - `stage_00_base`
 - `stage_01_outer_contour`
 - `stage_02_facial_features`
-- `stage_04_inner_contours`
-- `stage_05_value_regions`
-- `stage_07_fine_texture`
+- `stage_03_inner_contours`
+- `stage_04_value_regions`
+- `stage_05_fine_texture`
+- `stage_06_color`
+- `stage_07_background`
 - `annotations`
 
 For each stage and sample stem:
@@ -34,9 +36,11 @@ For each stage and sample stem:
 1. `base_ellipses` (Stage 00): head/body ellipse scaffold from mask split.
 2. `add_outer_contour` (Stage 01): simplified owl silhouette contour.
 3. `add_facial_features` (Stage 02): eyes and beak from upper-region heuristics.
-4. `add_inner_contours` (Stage 04): medium-scale internal contour structure.
-5. `add_value_regions` (Stage 05): coarse tonal zones from quantized grayscale.
-6. `add_fine_texture` (Stage 07): high-frequency residual detail layer.
+4. `add_inner_contours` (Stage 03): medium-scale internal contour structure.
+5. `add_value_regions` (Stage 04): coarse tonal zones from quantized grayscale.
+6. `add_fine_texture` (Stage 05): high-frequency residual detail layer.
+7. `add_color` (Stage 06): chroma transfer while preserving prior structure.
+8. `add_background` (Stage 07): outside-mask background and final reconstruction.
 
 ## Modeling Note
 
@@ -88,7 +92,7 @@ python data_pipeline.py --data-root data/owl_output --stages all --overwrite
 The project now includes a first implementation slice for stage learning:
 
 - Build frame and transition manifests split by owl stem.
-- Extract frozen CLIP embeddings for each stage frame.
+- Extract frozen CLIP embeddings for each stage frame and its per-stage layer.
 - Run stage-level embedding diagnostics (clusterability and similarity).
 
 Install dependencies:
@@ -138,7 +142,35 @@ python scripts/train_transition_baseline.py \
 Run latent rollout inference from a rough sketch and retrieve nearest stage images:
 
 ```bash
-python scripts/infer_transition_rollout.py path/to/rough_sketch.png \
+python scripts/infer_transition_rollout.py data/owl_output/stage_00_base/owl_23_stage00.png --checkpoint data/owl_output/learning/ar_baseline/best_model.pt --embeddings-npz data/owl_output/learning/embeddings/clip_embeddings_all.npz --manifest-frames data/owl_output/learning/manifest_frames.csv --output-dir data/owl_output/learning/inference
+```
+
+Train a structural layer decoder for sparse line-art stages `0->1` through `2->3`:
+
+```bash
+python scripts/train_structural_layer_decoder.py \
+	--transitions-csv data/owl_output/learning/manifest_transitions.csv \
+	--data-root data/owl_output \
+	--output-dir data/owl_output/learning/structural_decoder \
+	--device cuda \
+	--base-channels 32 \
+	--cond-dim 128 \
+	--batch-size 8
+```
+
+Train a dense one-step pixel decoder for appearance stages `3->4` through `6->7`:
+
+```bash
+python scripts/train_pixel_decoder.py --transitions-csv data/owl_output/learning/manifest_transitions.csv --latent-checkpoint data/owl_output/learning/ar_baseline/best_model.pt --latent-metrics-json data/owl_output/learning/ar_baseline/metrics.json --output-dir data/owl_output/learning/pixel_decoder --device cpu --min-src-stage 3 --max-src-stage 6 --output-mode residual --change-weight 8.0 --foreground-weight 2.0 --delta-weight 5.0 --delta-change-weight 16.0 --conditioning-mode mix
+```
+
+The pixel decoder embedding archive must match the latent checkpoint embedding family. If you use the checked-in `data/owl_output/learning/ar_baseline` artifacts, the script now auto-resolves the matching archive from `metrics.json`.
+
+Run pixel-space rollout with the trained decoder:
+
+```bash
+python scripts/infer_transition_rollout.py data/owl_output/stage_00_base/owl_23_stage00.png \
+	--render-mode pixel \
 	--checkpoint data/owl_output/learning/ar_baseline/best_model.pt \
 	--embeddings-npz data/owl_output/learning/embeddings/clip_embeddings_all.npz \
 	--manifest-frames data/owl_output/learning/manifest_frames.csv \
@@ -157,7 +189,8 @@ Primary artifacts:
 
 Each stage is implemented as a separate function and can run independently if required prerequisites exist.
 
-- Stages `01, 02, 04, 05, 07` consume prior grayscale cumulative outputs.
+- Stages `01-06` need previous grayscale cumulative output.
+- Stage `07` needs stage `06` color cumulative output.
 
 When prerequisites are missing, the script prints clear errors and continues with the next sample.
 

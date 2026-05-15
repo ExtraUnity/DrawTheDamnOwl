@@ -5,7 +5,7 @@ from typing import Dict, List, Sequence
 
 from script_utils import LEARNING_ROOT, ROOT, ensure_dir, write_csv, write_json
 
-from owl_pipeline_utils import STAGE_SPECS, collect_sample_stems, stage_cumulative_path  # noqa: E402
+from owl_pipeline_utils import STAGE_SPECS, collect_sample_stems, stage_cumulative_path, stage_layer_path  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -112,11 +112,13 @@ def main() -> None:
             stage_file = Path(stage_cumulative_path(str(data_root), stem, stage_idx))
             if not stage_file.exists():
                 continue
+            layer_file = Path(stage_layer_path(str(data_root), stem, stage_idx))
             frame_rows.append(
                 {
                     "stem": stem,
                     "stage_idx": str(stage_idx),
                     "image_path": str(stage_file),
+                    "layer_path": str(layer_file) if layer_file.exists() else "",
                     "frame_key": f"{stem}_stage{stage_idx:02d}",
                 }
             )
@@ -158,7 +160,7 @@ def main() -> None:
     write_csv(
         output_dir / "manifest_frames.csv",
         frame_rows,
-        ["stem", "split", "stage_idx", "image_path", "frame_key"],
+        ["stem", "split", "stage_idx", "image_path", "layer_path", "frame_key"],
     )
     write_csv(
         output_dir / "manifest_transitions.csv",
