@@ -326,6 +326,131 @@ class TransitionSequenceTransformer(nn.Module):
         return F.normalize(pred, p=2, dim=-1)
 
 
+class TemporalResidualBlock(nn.Module):
+    def __init__(self, channels: int, kernel_size: int, dilation: int, dropout: float):
+        super().__init__()
+        if kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be odd for symmetric temporal padding")
+        padding = dilation * (kernel_size // 2)
+        groups = _group_count(channels)
+        self.norm1 = nn.GroupNorm(num_groups=groups, num_channels=channels)
+        self.conv1 = nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=padding, dilation=dilation)
+        self.norm2 = nn.GroupNorm(num_groups=groups, num_channels=channels)
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=padding, dilation=dilation)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        h = self.conv1(F.silu(self.norm1(x)))
+        h = self.dropout(h)
+        h = self.conv2(F.silu(self.norm2(h)))
+        return residual + h
+
+
+class TransitionSequenceCNN(nn.Module):
+    def __init__(
+        self,
+        embedding_dim: int,
+        model_dim: int,
+        num_layers: int,
+        kernel_size: int,
+        dilation_cycle: int,
+        dropout: float,
+        num_stages: int,
+        max_seq_len: int,
+        stage_embed_dim: int,
+        stage_specific_output_heads: bool = True,
+    ):
+        super().__init__()
+        if max_seq_len <= 0:
+            raise ValueError("max_seq_len must be positive")
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive")
+        if dilation_cycle <= 0:
+            raise ValueError("dilation_cycle must be positive")
+
+        self.max_seq_len = int(max_seq_len)
+        self.num_stages = int(num_stages)
+        self.stage_specific_output_heads = bool(stage_specific_output_heads)
+        self.feature_norm = nn.LayerNorm(embedding_dim)
+        self.input_proj = nn.Linear(embedding_dim, model_dim)
+        self.stage_embed = nn.Embedding(num_stages, stage_embed_dim)
+        self.stage_proj = nn.Linear(stage_embed_dim, model_dim)
+        self.pos_embed = nn.Embedding(max_seq_len, model_dim)
+        self.input_norm = nn.LayerNorm(model_dim)
+        self.input_dropout = nn.Dropout(dropout)
+        self.blocks = nn.ModuleList(
+            [
+                TemporalResidualBlock(
+                    channels=model_dim,
+                    kernel_size=kernel_size,
+                    dilation=2 ** (layer_idx % dilation_cycle),
+                    dropout=dropout,
+                )
+                for layer_idx in range(num_layers)
+            ]
+        )
+        if self.stage_specific_output_heads:
+            self.output_heads = nn.ModuleList([nn.Linear(model_dim, embedding_dim) for _ in range(num_stages)])
+        else:
+            self.output_head = nn.Linear(model_dim, embedding_dim)
+        self.readout = nn.Sequential(
+            nn.LayerNorm(model_dim),
+            nn.Linear(model_dim, model_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def _apply_output_head(self, hidden: torch.Tensor, stage_idx: torch.Tensor) -> torch.Tensor:
+        if not self.stage_specific_output_heads:
+            return self.output_head(hidden)
+
+        out = []
+        for row_hidden, row_stage in zip(hidden, stage_idx):
+            out.append(self.output_heads[int(row_stage.item())](row_hidden))
+        return torch.stack(out, dim=0)
+
+    def forward(
+        self,
+        src_embeddings: torch.Tensor,
+        src_stage_idx: torch.Tensor,
+        src_padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if src_embeddings.ndim != 3:
+            raise ValueError(f"Expected src_embeddings shape [batch, seq, dim], got {tuple(src_embeddings.shape)}")
+        if src_stage_idx.shape != src_padding_mask.shape:
+            raise ValueError("src_stage_idx and src_padding_mask must have matching shapes")
+        if src_embeddings.shape[:2] != src_stage_idx.shape:
+            raise ValueError("src_embeddings batch/seq dims must match src_stage_idx")
+        if src_embeddings.shape[1] > self.max_seq_len:
+            raise ValueError(f"Sequence length {src_embeddings.shape[1]} exceeds max_seq_len={self.max_seq_len}")
+
+        positions = torch.arange(src_embeddings.shape[1], device=src_embeddings.device).unsqueeze(0)
+        src_embeddings_norm = self.feature_norm(src_embeddings)
+        hidden = self.input_proj(src_embeddings_norm)
+        hidden = hidden + self.stage_proj(self.stage_embed(src_stage_idx)) + self.pos_embed(positions)
+        hidden = self.input_dropout(self.input_norm(hidden))
+
+        valid_mask = (~src_padding_mask).unsqueeze(-1).to(dtype=hidden.dtype)
+        hidden = hidden * valid_mask
+        hidden = hidden.transpose(1, 2)
+        valid_mask_channels = valid_mask.transpose(1, 2)
+        for block in self.blocks:
+            hidden = block(hidden)
+            hidden = hidden * valid_mask_channels
+        hidden = hidden.transpose(1, 2)
+
+        lengths = (~src_padding_mask).sum(dim=1).clamp(min=1)
+        last_idx = lengths - 1
+        batch_idx = torch.arange(src_embeddings.shape[0], device=src_embeddings.device)
+        last_hidden = hidden[batch_idx, last_idx]
+        last_src = src_embeddings[batch_idx, last_idx]
+        last_stage = src_stage_idx[batch_idx, last_idx]
+        delta = self._apply_output_head(self.readout(last_hidden), last_stage)
+        pred = last_src + delta
+        return F.normalize(pred, p=2, dim=-1)
+
+
 def _group_count(channels: int, preferred: int = 8) -> int:
     for groups in range(min(preferred, channels), 0, -1):
         if channels % groups == 0:
